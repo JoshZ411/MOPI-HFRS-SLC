@@ -61,6 +61,8 @@ Both operate on identical frozen embeddings.
 
 Before implementation, lock these decisions:
 
+**GPU:** A100 will be available. Default to `device="cuda"` throughout.
+
 **Embedding freezing:** GNN training completes; user/item embeddings are frozen (no backprop during RL).
 
 **Candidate pool size M:** Top-M items per user governs action space size.
@@ -276,6 +278,24 @@ Final step: Evaluate π(· | s, w*) on test split.
 
 Deliverable:
     Selected weight vector w*; test-set evaluation metrics under w*.
+
+---
+
+# LOGGING AND DOCUMENTATION
+
+**Agent Responsibility:** Maintain a running log of all implementation work in `auto_logs.md`.
+
+Log after completing each phase and should include:
+- **Phase completion summary:** What was implemented, file paths created/modified.
+- **Key decisions made:** Any hyperparameter choices, design trade-offs, or ambiguities resolved.
+- **Git commits:** Reference any commits created during the phase.
+- **Blockers and resolutions:** Any issues encountered and how they were addressed.
+- **Code snippets:** Brief inline examples of critical functions/classes added.
+- **Next-phase notes:** Clarifications or assumptions that affect downstream phases.
+
+Format: Use markdown with phase headers (e.g., `## Phase 1: Embedding Extraction`) and timestamp entries where relevant.
+
+This log enables rapid investigation of implementation decisions and serves as a traceback for debugging or adjustments.
 
 ---
 
