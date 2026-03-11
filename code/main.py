@@ -150,6 +150,9 @@ def main():
 
     with torch.no_grad():
         model.eval()
+        users_emb_final, _, items_emb_final, _ = \
+            model.forward(feature_dict, test_edge_index, pos_test_edge_index, neg_test_edge_index)
+
         _, recall, precision, ndcg, health_score, avg_health_tags_ratio, percentage_recommended_foods = \
                 eval(model, feature_dict, user_tags, food_tags, test_edge_index, pos_test_edge_index, neg_test_edge_index,
                                 [neg_train_edge_index], args.K, LAMBDA)
@@ -170,6 +173,12 @@ def main():
                 'test_avg_health_tags_ratio': round(avg_health_tags_ratio, 5),
                 'test_percentage_recommended_foods': round(percentage_recommended_foods, 5)
             })
+
+        # Save frozen embeddings for downstream MORL training (Phase 1)
+        torch.save({'user_emb': users_emb_final.detach().cpu(),
+                    'item_emb': items_emb_final.detach().cpu()},
+                   'embeddings_checkpoint.pt')
+        print("Frozen embeddings saved to embeddings_checkpoint.pt")
 
 
 if __name__ == '__main__':
