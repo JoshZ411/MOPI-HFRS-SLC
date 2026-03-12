@@ -107,7 +107,7 @@ class ConditionalPolicy(nn.Module):
         self,
         state: torch.Tensor,
         weight: torch.Tensor,
-        remaining_indices: List[int],
+        remaining_items: List[int],
         num_candidates: int,
         greedy: bool = False,
     ):
@@ -117,8 +117,10 @@ class ConditionalPolicy(nn.Module):
         ----------
         state : torch.Tensor  shape (state_dim,)
         weight : torch.Tensor  shape (weight_dim,)
-        remaining_indices : List[int]
-            Positions in the *full* candidate pool that are still available.
+        remaining_items : List[int]
+            Global item IDs still available in the current candidate pool.
+            The policy head operates over local candidate-pool positions, so
+            only the current pool length is used here.
         num_candidates : int
             Total pool size M (used to build the mask).
         greedy : bool
@@ -127,15 +129,22 @@ class ConditionalPolicy(nn.Module):
         Returns
         -------
         action : int
-            Position within ``remaining_indices`` (i.e. index into the
+            Position within ``remaining_items`` (i.e. index into the
             *remaining* subpool, consistent with ``env.step(action)``).
         log_prob : torch.Tensor  scalar
         """
         mask = torch.zeros(num_candidates, dtype=torch.bool, device=state.device)
-        mask[remaining_indices] = True
+        active_count = min(len(remaining_items), num_candidates)
+        if active_count == 0:
+            raise ValueError('select_action called with an empty candidate pool')
+
+        # The policy head is defined over candidate-pool slots [0, M). The
+        # environment keeps global item IDs in its remaining list, so valid
+        # actions are the active local positions [0, len(remaining_items)).
+        mask[:active_count] = True
 
         log_probs = self.forward(state, weight, mask=mask)  # (num_candidates,)
-        valid_log_probs = log_probs[remaining_indices]
+        valid_log_probs = log_probs[:active_count]
 
         if greedy:
             local_action = valid_log_probs.argmax().item()
