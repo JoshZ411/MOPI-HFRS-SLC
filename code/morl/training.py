@@ -5,13 +5,17 @@ No gradients flow into the frozen GNN embeddings.
 Only the ConditionalPolicy parameters are updated.
 """
 
+import logging
 import math
+import os
+from itertools import combinations
+from typing import Any, Dict, List, Optional
+
 import torch
 import torch.optim as optim
-import os
-from typing import List, Optional, Dict, Any
 
 from .environment import RecommendationEnv, build_candidate_pools
+from .logging_utils import append_jsonl
 from .policy import ConditionalPolicy, sample_weight_vector
 
 
@@ -29,30 +33,152 @@ def run_episode(
     -------
     log_probs : List[torch.Tensor]   per-step log π(a_t | s_t, w)
     rewards   : torch.Tensor  shape (K, 3)  multi-objective reward vectors
+    diagnostics : dict
     """
     state = env.reset(user_id).to(device)
     log_probs: List[torch.Tensor] = []
     reward_list: List[torch.Tensor] = []
+    entropies: List[float] = []
+    selected_positions: List[int] = []
+    selected_probs: List[float] = []
+    max_probs: List[float] = []
 
     while True:
         remaining = env.remaining
         if not remaining:
             break
 
-        action, log_prob = policy.select_action(
-            state, weight, remaining, num_candidates
+        action, log_prob, info = policy.select_action(
+            state, weight, remaining, num_candidates, return_info=True
         )
         state, reward, done = env.step(action)
         state = state.to(device)
 
         log_probs.append(log_prob)
         reward_list.append(reward.to(device))
+        entropies.append(info['entropy'])
+        selected_positions.append(action)
+        selected_probs.append(info['selected_prob'])
+        max_probs.append(info['max_prob'])
 
         if done:
             break
 
     rewards = torch.stack(reward_list)  # (T, 3)
-    return log_probs, rewards
+    diagnostics = {
+        'episode_length': len(reward_list),
+        'mean_entropy': sum(entropies) / len(entropies) if entropies else 0.0,
+        'selected_positions': selected_positions,
+        'mean_selected_prob': sum(selected_probs) / len(selected_probs) if selected_probs else 0.0,
+        'mean_max_prob': sum(max_probs) / len(max_probs) if max_probs else 0.0,
+    }
+    return log_probs, rewards, diagnostics
+
+
+def _safe_mean(values: List[float]) -> float:
+    return sum(values) / len(values) if values else 0.0
+
+
+def _safe_std(values: List[float]) -> float:
+    if len(values) <= 1:
+        return 0.0
+    mean_value = _safe_mean(values)
+    variance = sum((value - mean_value) ** 2 for value in values) / len(values)
+    return math.sqrt(variance)
+
+
+def _grad_norm(policy: ConditionalPolicy) -> float:
+    total = 0.0
+    for param in policy.parameters():
+        if param.grad is None:
+            continue
+        grad_value = param.grad.detach().data.norm(2).item()
+        total += grad_value ** 2
+    return math.sqrt(total)
+
+
+def summarize_candidate_pools(candidate_pools: Dict[int, List[int]], K: int) -> Dict[str, float]:
+    sizes = [len(items) for items in candidate_pools.values()]
+    if not sizes:
+        return {
+            'pool_users': 0.0,
+            'pool_size_mean': 0.0,
+            'pool_size_min': 0.0,
+            'pool_size_max': 0.0,
+            'pool_users_below_k': 0.0,
+        }
+    below_k = sum(size < K for size in sizes)
+    return {
+        'pool_users': float(len(sizes)),
+        'pool_size_mean': _safe_mean(sizes),
+        'pool_size_min': float(min(sizes)),
+        'pool_size_max': float(max(sizes)),
+        'pool_users_below_k': float(below_k),
+    }
+
+
+def probe_weight_sensitivity(
+    policy: ConditionalPolicy,
+    env: RecommendationEnv,
+    user_ids: List[int],
+    num_candidates: int,
+    device: torch.device,
+) -> Dict[str, float]:
+    if not user_ids:
+        return {
+            'probe_pairwise_jaccard': 0.0,
+            'probe_unique_items': 0.0,
+            'probe_first_action_span': 0.0,
+        }
+
+    probe_weights = [
+        torch.tensor([1.0, 0.0, 0.0], device=device),
+        torch.tensor([0.0, 1.0, 0.0], device=device),
+        torch.tensor([0.0, 0.0, 1.0], device=device),
+        torch.tensor([1 / 3, 1 / 3, 1 / 3], device=device),
+    ]
+    pairwise_jaccard: List[float] = []
+    unique_item_ratios: List[float] = []
+    first_action_spans: List[float] = []
+
+    with torch.no_grad():
+        for user_id in user_ids:
+            lists = []
+            first_actions = []
+            for weight in probe_weights:
+                state = env.reset(user_id).to(device)
+                while True:
+                    remaining = env.remaining
+                    if not remaining:
+                        break
+                    action, _ = policy.select_action(state, weight, remaining, num_candidates, greedy=True)
+                    if not env.selected:
+                        first_actions.append(action)
+                    state, _, done = env.step(action)
+                    state = state.to(device)
+                    if done:
+                        break
+                lists.append(list(env.selected))
+
+            for idx_a, idx_b in combinations(range(len(lists)), 2):
+                set_a = set(lists[idx_a])
+                set_b = set(lists[idx_b])
+                union = set_a | set_b
+                if union:
+                    pairwise_jaccard.append(len(set_a & set_b) / len(union))
+
+            flat_items = set(item for rec_list in lists for item in rec_list)
+            total_slots = sum(len(rec_list) for rec_list in lists)
+            if total_slots:
+                unique_item_ratios.append(len(flat_items) / total_slots)
+            if first_actions:
+                first_action_spans.append(float(max(first_actions) - min(first_actions)))
+
+    return {
+        'probe_pairwise_jaccard': _safe_mean(pairwise_jaccard),
+        'probe_unique_items': _safe_mean(unique_item_ratios),
+        'probe_first_action_span': _safe_mean(first_action_spans),
+    }
 
 
 def train_morl(
@@ -72,6 +198,12 @@ def train_morl(
     lr: float = 1e-3,
     checkpoint_dir: str = '.',
     checkpoint_every: int = 10,
+    log_every: int = 10,
+    metrics_path: Optional[str] = None,
+    logger: Optional[logging.Logger] = None,
+    tracker: Optional[Any] = None,
+    probe_user_ids: Optional[List[int]] = None,
+    probe_every: int = 10,
     device: Optional[torch.device] = None,
 ) -> ConditionalPolicy:
     """Train the MORL conditional policy.
@@ -103,9 +235,10 @@ def train_morl(
     """
     dev = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     os.makedirs(checkpoint_dir, exist_ok=True)
+    logger = logger or logging.getLogger(__name__)
 
     # ----- Build candidate pools (fixed for entire RL training) -----
-    print("Building candidate pools ...")
+    logger.info('Building candidate pools for MORL training ...')
     pools = build_candidate_pools(
         user_emb, item_emb, M=M,
         exclude_per_user=exclude_per_user_train,
@@ -113,6 +246,21 @@ def train_morl(
     )
     # Restrict to train users only
     train_pools = {u: pools[u] for u in train_user_ids if u in pools}
+    pool_stats = summarize_candidate_pools(train_pools, K=K)
+    logger.info(
+        'Candidate pools ready: users=%d mean_size=%.2f min=%d max=%d below_K=%d',
+        int(pool_stats['pool_users']),
+        pool_stats['pool_size_mean'],
+        int(pool_stats['pool_size_min']),
+        int(pool_stats['pool_size_max']),
+        int(pool_stats['pool_users_below_k']),
+    )
+    if pool_stats['pool_users_below_k'] > 0:
+        logger.warning(
+            '%d users have candidate pools smaller than K=%d; those episodes may terminate early.',
+            int(pool_stats['pool_users_below_k']),
+            K,
+        )
 
     # ----- Instantiate environment -----
     env = RecommendationEnv(
@@ -138,8 +286,17 @@ def train_morl(
     optimizer = optim.Adam(policy.parameters(), lr=lr)
 
     stats: List[Dict[str, Any]] = []
+    probe_user_ids = (probe_user_ids or [])[: min(len(probe_user_ids or []), 4)]
 
-    print(f"Starting MORL training: {num_epochs} epochs, batch_size={batch_size}, K={K}, M={M}")
+    logger.info(
+        'Starting MORL training: epochs=%d batch_size=%d K=%d M=%d lr=%.4g hidden_dim=%d',
+        num_epochs,
+        batch_size,
+        K,
+        M,
+        lr,
+        hidden_dim,
+    )
 
     for epoch in range(1, num_epochs + 1):
         policy.train()
@@ -150,16 +307,30 @@ def train_morl(
 
         all_log_probs: List[List[torch.Tensor]] = []
         all_returns: List[float] = []
+        reward_component_means: List[List[float]] = []
+        episode_lengths: List[float] = []
+        entropies: List[float] = []
+        selected_positions: List[int] = []
+        selected_probs: List[float] = []
+        max_probs: List[float] = []
+        sampled_weights: List[List[float]] = []
 
         for user_id in batch_users:
             w = sample_weight_vector(batch_size=1, device=dev)  # (3,)
-            log_probs, rewards = run_episode(
+            log_probs, rewards, episode_diag = run_episode(
                 env, policy, user_id, w, M, dev
             )
             # Scalar episodic return: R = Σ_t  w · r_t
             R = torch.sum(rewards @ w).item()
             all_log_probs.append(log_probs)
             all_returns.append(R)
+            reward_component_means.append(rewards.mean(dim=0).detach().cpu().tolist())
+            episode_lengths.append(float(episode_diag['episode_length']))
+            entropies.append(episode_diag['mean_entropy'])
+            selected_positions.extend(episode_diag['selected_positions'])
+            selected_probs.append(episode_diag['mean_selected_prob'])
+            max_probs.append(episode_diag['mean_max_prob'])
+            sampled_weights.append(w.detach().cpu().tolist())
 
         # REINFORCE baseline: mean return over the batch
         baseline = sum(all_returns) / len(all_returns)
@@ -173,20 +344,93 @@ def train_morl(
         policy_loss = sum(policy_loss_terms) / len(batch_users)
         optimizer.zero_grad()
         policy_loss.backward()
+        grad_norm = _grad_norm(policy)
         optimizer.step()
+
+        reward_pref = [reward[0] for reward in reward_component_means]
+        reward_health = [reward[1] for reward in reward_component_means]
+        reward_div = [reward[2] for reward in reward_component_means]
+        weight_pref = [weight[0] for weight in sampled_weights]
+        weight_health = [weight[1] for weight in sampled_weights]
+        weight_div = [weight[2] for weight in sampled_weights]
 
         epoch_stats = {
             'epoch': epoch,
             'policy_loss': policy_loss.item(),
             'mean_return': baseline,
+            'std_return': _safe_std(all_returns),
+            'mean_episode_length': _safe_mean(episode_lengths),
+            'mean_reward_pref': _safe_mean(reward_pref),
+            'mean_reward_health': _safe_mean(reward_health),
+            'mean_reward_div': _safe_mean(reward_div),
+            'std_reward_pref': _safe_std(reward_pref),
+            'std_reward_health': _safe_std(reward_health),
+            'std_reward_div': _safe_std(reward_div),
+            'mean_entropy': _safe_mean(entropies),
+            'mean_selected_prob': _safe_mean(selected_probs),
+            'mean_max_prob': _safe_mean(max_probs),
+            'mean_action_position': _safe_mean(selected_positions),
+            'std_action_position': _safe_std([float(position) for position in selected_positions]),
+            'grad_norm': grad_norm,
+            'weight_pref_mean': _safe_mean(weight_pref),
+            'weight_health_mean': _safe_mean(weight_health),
+            'weight_div_mean': _safe_mean(weight_div),
         }
+
+        if selected_positions:
+            top_positions = {f'action_pos_{idx}_rate': 0.0 for idx in range(min(10, M))}
+            total_positions = len(selected_positions)
+            for idx in range(min(10, M)):
+                top_positions[f'action_pos_{idx}_rate'] = (
+                    sum(position == idx for position in selected_positions) / total_positions
+                )
+            epoch_stats.update(top_positions)
+
+        if probe_user_ids and epoch % probe_every == 0:
+            probe_stats = probe_weight_sensitivity(
+                policy=policy,
+                env=env,
+                user_ids=[user_id for user_id in probe_user_ids if user_id in train_pools],
+                num_candidates=M,
+                device=dev,
+            )
+            epoch_stats.update(probe_stats)
+            if probe_stats['probe_first_action_span'] < 0.5:
+                logger.warning(
+                    'Epoch %d probe suggests weak weight sensitivity: first_action_span=%.3f pairwise_jaccard=%.3f',
+                    epoch,
+                    probe_stats['probe_first_action_span'],
+                    probe_stats['probe_pairwise_jaccard'],
+                )
+
         stats.append(epoch_stats)
 
-        if epoch % 10 == 0:
-            print(
-                f"Epoch {epoch:4d} | loss={policy_loss.item():.4f} | "
-                f"mean_return={baseline:.4f}"
+        if metrics_path is not None:
+            append_jsonl(metrics_path, {'type': 'train_epoch', **epoch_stats})
+
+        if tracker is not None:
+            tracker.log({f'train/{key}': value for key, value in epoch_stats.items()}, step=epoch)
+
+        if epoch % log_every == 0:
+            logger.info(
+                'Epoch %4d | loss=%.4f return=%.4f±%.4f | reward[p/h/d]=%.4f/%.4f/%.4f | '
+                'entropy=%.4f grad=%.4f action_pos_mean=%.2f',
+                epoch,
+                epoch_stats['policy_loss'],
+                epoch_stats['mean_return'],
+                epoch_stats['std_return'],
+                epoch_stats['mean_reward_pref'],
+                epoch_stats['mean_reward_health'],
+                epoch_stats['mean_reward_div'],
+                epoch_stats['mean_entropy'],
+                epoch_stats['grad_norm'],
+                epoch_stats['mean_action_position'],
             )
+
+        if epoch_stats['mean_entropy'] < 0.05:
+            logger.warning('Epoch %d action entropy is very low (%.4f); exploration may have collapsed.', epoch, epoch_stats['mean_entropy'])
+        if epoch_stats['std_reward_pref'] < 1e-4 and epoch_stats['std_reward_health'] < 1e-4 and epoch_stats['std_reward_div'] < 1e-4:
+            logger.warning('Epoch %d reward variance is nearly zero across the batch.', epoch)
 
         if epoch % checkpoint_every == 0:
             ckpt_path = os.path.join(checkpoint_dir, f'morl_policy_epoch{epoch}.pt')
@@ -197,6 +441,7 @@ def train_morl(
                  'stats': stats},
                 ckpt_path,
             )
+            logger.info('Saved checkpoint: %s', ckpt_path)
 
     # Final checkpoint
     final_path = os.path.join(checkpoint_dir, 'morl_policy_final.pt')
@@ -207,7 +452,7 @@ def train_morl(
          'stats': stats},
         final_path,
     )
-    print(f"Training complete. Final checkpoint saved to {final_path}")
+    logger.info('Training complete. Final checkpoint saved to %s', final_path)
     return policy
 
 

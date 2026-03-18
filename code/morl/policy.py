@@ -18,7 +18,7 @@ Architecture:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 
 class ConditionalPolicy(nn.Module):
@@ -110,6 +110,7 @@ class ConditionalPolicy(nn.Module):
         remaining_items: List[int],
         num_candidates: int,
         greedy: bool = False,
+        return_info: bool = False,
     ):
         """Sample (or greedily select) an action from the remaining candidate pool.
 
@@ -132,6 +133,8 @@ class ConditionalPolicy(nn.Module):
             Position within ``remaining_items`` (i.e. index into the
             *remaining* subpool, consistent with ``env.step(action)``).
         log_prob : torch.Tensor  scalar
+        info : dict, optional
+            Policy diagnostics for the chosen action.
         """
         mask = torch.zeros(num_candidates, dtype=torch.bool, device=state.device)
         active_count = min(len(remaining_items), num_candidates)
@@ -153,7 +156,18 @@ class ConditionalPolicy(nn.Module):
             local_action = torch.multinomial(probs, num_samples=1).item()
 
         log_prob = valid_log_probs[local_action]
-        return local_action, log_prob
+        if not return_info:
+            return local_action, log_prob
+
+        probs = valid_log_probs.exp()
+        entropy = -(probs * valid_log_probs).sum()
+        info: Dict[str, float] = {
+            'entropy': entropy.item(),
+            'selected_prob': probs[local_action].item(),
+            'max_prob': probs.max().item(),
+            'active_count': float(active_count),
+        }
+        return local_action, log_prob, info
 
 
 def sample_weight_vector(

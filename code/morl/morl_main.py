@@ -6,6 +6,7 @@ Usage (from the code/ directory, after running main.py):
     python -m morl.morl_main \\
         --checkpoint embeddings_checkpoint.pt \\
         --graph_path ../processed_data/benchmark_macro.pt \\
+        --device cuda \
         --epochs 200 \\
         --batch_size 64 \\
         --K 20 \\
@@ -21,13 +22,15 @@ This script:
 """
 
 import argparse
+import csv
 import os
-import torch
+import sys
 import numpy as np
+import torch
 from sklearn.model_selection import train_test_split
 
-from .environment import build_candidate_pools
-from .policy import ConditionalPolicy, sample_weight_vector
+from .logging_utils import WandbTracker, append_jsonl, build_run_config, save_json, setup_logger
+from .policy import sample_weight_vector
 from .training import train_morl, evaluate_morl
 
 
@@ -62,6 +65,21 @@ def simplex_grid(n_points: int = 15) -> list:
     return corners + random_pts
 
 
+def resolve_device(device_arg: str) -> torch.device:
+    """Resolve the requested device string into a torch.device."""
+    if device_arg == 'auto':
+        return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    if device_arg.startswith('cuda') and not torch.cuda.is_available():
+        raise RuntimeError(
+            'CUDA was requested, but torch.cuda.is_available() is False. '
+            'Use a CUDA-enabled PyTorch build and launch the script from that environment, '
+            'or rerun with --device cpu.'
+        )
+
+    return torch.device(device_arg)
+
+
 def main():
     parser = argparse.ArgumentParser(description='MORL sequential recommendation')
     parser.add_argument('--checkpoint', type=str, default='embeddings_checkpoint.pt',
@@ -76,31 +94,78 @@ def main():
     parser.add_argument('--hidden_dim', type=int, default=256)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--output_dir', type=str, default='morl_output')
+    parser.add_argument('--device', type=str, default='auto',
+                        help='Device to run on: auto, cpu, cuda, or cuda:N.')
     parser.add_argument('--val_weight_alpha', type=float, default=0.7,
                         help='Weight for NDCG in w* selection (1-alpha → health).')
+    parser.add_argument('--log_every', type=int, default=10,
+                        help='Epoch interval for training log summaries.')
+    parser.add_argument('--probe_every', type=int, default=10,
+                        help='Epoch interval for fixed-user weight sensitivity probes.')
+    parser.add_argument('--num_probe_users', type=int, default=4,
+                        help='Number of train users to use for weight-sensitivity probes.')
+    parser.add_argument('--use_wandb', action='store_true',
+                        help='Enable Weights & Biases logging for MORL runs.')
+    parser.add_argument('--wandb_project', type=str, default='mopi-morl',
+                        help='W&B project name used when --use_wandb is set.')
+    parser.add_argument('--wandb_entity', type=str, default=None,
+                        help='Optional W&B entity/team.')
+    parser.add_argument('--wandb_mode', type=str, default='offline', choices=['online', 'offline', 'disabled'],
+                        help='W&B mode. Use offline for terminal-only workflows and wandb beta leet.')
+    parser.add_argument('--run_name', type=str, default=None,
+                        help='Optional run name for logging outputs and W&B.')
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Device: {device}")
+    device = resolve_device(args.device)
 
     os.makedirs(args.output_dir, exist_ok=True)
+    logger = setup_logger(args.output_dir)
+    metrics_path = os.path.join(args.output_dir, 'train_metrics.jsonl')
+    eval_path = os.path.join(args.output_dir, 'eval_metrics.jsonl')
+    config_path = os.path.join(args.output_dir, 'run_config.json')
+    wandb_dir = os.path.join(args.output_dir, 'wandb')
+    leet_hint_path = os.path.join(args.output_dir, 'wandb_leet_command.txt')
+
+    tracker = WandbTracker(
+        enabled=args.use_wandb,
+        project=args.wandb_project,
+        entity=args.wandb_entity,
+        run_name=args.run_name,
+        mode=args.wandb_mode,
+        base_dir=wandb_dir,
+        config=build_run_config(args),
+        logger=logger,
+    )
+    save_json(config_path, build_run_config(args, extra={'device': str(device)}))
+    logger.info('Device: %s', device)
+    logger.info('Run configuration saved to %s', config_path)
+    if tracker.enabled:
+        leet_command = tracker.leet_command(sys.executable)
+        if leet_command is not None:
+            with open(leet_hint_path, 'w', encoding='utf-8') as handle:
+                handle.write(leet_command)
+                handle.write('\n')
+            logger.info('To view live local W&B plots during training, run: %s', leet_command)
+            logger.info('LEET command saved to %s', leet_hint_path)
+            logger.info('LEET charts begin populating after the first epoch is logged.')
+    else:
+        logger.info('W&B tracking is disabled. Pass --use_wandb to enable local live plots and metric history.')
 
     # ------------------------------------------------------------------
     # Phase 1: Load frozen embeddings
     # ------------------------------------------------------------------
-    print(f"\n[Phase 1] Loading embeddings from {args.checkpoint} ...")
+    logger.info('[Phase 1] Loading embeddings from %s', args.checkpoint)
     ckpt = torch.load(args.checkpoint, map_location='cpu')
     user_emb = ckpt['user_emb']   # (num_users, d)
     item_emb = ckpt['item_emb']   # (num_items, d)
-    print(f"  user_emb: {tuple(user_emb.shape)}")
-    print(f"  item_emb: {tuple(item_emb.shape)}")
+    logger.info('Embedding shapes: user_emb=%s item_emb=%s', tuple(user_emb.shape), tuple(item_emb.shape))
 
     # ------------------------------------------------------------------
     # Load graph for tags and edge splits
     # ------------------------------------------------------------------
-    print(f"\nLoading graph from {args.graph_path} ...")
+    logger.info('Loading graph from %s', args.graph_path)
     graph = torch.load(args.graph_path, map_location='cpu')
     user_tags = graph['user'].tags  # (num_users, tag_dim)
     food_tags = graph['food'].tags  # (num_items, tag_dim)
@@ -123,6 +188,7 @@ def main():
     train_users = train_edge_index[0].unique().tolist()
     val_users = val_edge_index[0].unique().tolist()
     test_users = test_edge_index[0].unique().tolist()
+    probe_users = train_users[:args.num_probe_users]
 
     # Exclusion dicts (only used at eval time)
     exclude_val = build_exclude_dict(train_edge_index)
@@ -130,10 +196,28 @@ def main():
     for u, items in build_exclude_dict(val_edge_index).items():
         exclude_test.setdefault(u, set()).update(items)
 
+    logger.info(
+        'Graph stats: users=%d items=%d tags=%d edges=%d',
+        user_emb.size(0),
+        item_emb.size(0),
+        user_tags.size(1),
+        edge_index.size(1),
+    )
+    logger.info(
+        'Split stats: train_edges=%d val_edges=%d test_edges=%d | train_users=%d val_users=%d test_users=%d',
+        train_edge_index.size(1),
+        val_edge_index.size(1),
+        test_edge_index.size(1),
+        len(train_users),
+        len(val_users),
+        len(test_users),
+    )
+    logger.info('Probe users for fixed-weight diagnostics: %s', probe_users)
+
     # ------------------------------------------------------------------
     # Phases 3–6: Train MORL policy
     # ------------------------------------------------------------------
-    print("\n[Phases 3-6] Training MORL policy ...")
+    logger.info('[Phases 3-6] Training MORL policy')
     policy = train_morl(
         user_emb=user_emb,
         item_emb=item_emb,
@@ -150,20 +234,25 @@ def main():
         batch_size=args.batch_size,
         lr=args.lr,
         checkpoint_dir=args.output_dir,
+        log_every=args.log_every,
+        metrics_path=metrics_path,
+        logger=logger,
+        tracker=tracker,
+        probe_user_ids=probe_users,
+        probe_every=args.probe_every,
         device=device,
     )
 
     # ------------------------------------------------------------------
-    # Phase 7: Trade-off selection via validation metrics
+    # Phase 7: Trade-off selection via validation metrics.
     # ------------------------------------------------------------------
-    print("\n[Phase 7] Selecting best trade-off weight w* via validation metrics ...")
+    logger.info('[Phase 7] Selecting best trade-off weight w* via validation metrics')
     weight_grid = simplex_grid(n_points=15)
     best_score = -1.0
     best_w = weight_grid[3]  # uniform default
 
-    print(f"{'w_pref':>8} {'w_health':>9} {'w_div':>7} | "
-          f"{'NDCG':>8} {'Health':>8} {'Div':>8} | {'score':>8}")
-    print('-' * 68)
+    logger.info('%8s %9s %7s | %8s %8s %8s | %8s', 'w_pref', 'w_health', 'w_div', 'NDCG', 'Health', 'Div', 'score')
+    logger.info('%s', '-' * 68)
 
     median_div = None
     all_val_results = []
@@ -187,6 +276,7 @@ def main():
     # Compute median diversity for diversity threshold
     div_vals = [m['diversity'] for _, m in all_val_results]
     median_div = float(np.median(div_vals))
+    val_rows = []
 
     for w, metrics in all_val_results:
         wp, wh, wd = w[0].item(), w[1].item(), w[2].item()
@@ -196,20 +286,73 @@ def main():
                     (1 - args.val_weight_alpha) * metrics['health_score']
         else:
             score = -1.0
-        print(f"{wp:8.3f} {wh:9.3f} {wd:7.3f} | "
-              f"{metrics['ndcg']:8.4f} {metrics['health_score']:8.4f} "
-              f"{metrics['diversity']:8.4f} | {score:8.4f}")
+        row = {
+            'w_pref': wp,
+            'w_health': wh,
+            'w_div': wd,
+            'ndcg': metrics['ndcg'],
+            'health_score': metrics['health_score'],
+            'diversity': metrics['diversity'],
+            'recall': metrics['recall'],
+            'score': score,
+            'passes_diversity_constraint': metrics['diversity'] >= median_div,
+        }
+        val_rows.append(row)
+        append_jsonl(eval_path, {'type': 'val_weight', **row})
+        logger.info(
+            '%8.3f %9.3f %7.3f | %8.4f %8.4f %8.4f | %8.4f',
+            wp,
+            wh,
+            wd,
+            metrics['ndcg'],
+            metrics['health_score'],
+            metrics['diversity'],
+            score,
+        )
         if score > best_score:
             best_score = score
             best_w = w
 
-    print(f"\nSelected w* = [{best_w[0]:.3f}, {best_w[1]:.3f}, {best_w[2]:.3f}]"
-          f"  (val score={best_score:.4f})")
+    ndcg_span = max(row['ndcg'] for row in val_rows) - min(row['ndcg'] for row in val_rows)
+    health_span = max(row['health_score'] for row in val_rows) - min(row['health_score'] for row in val_rows)
+    div_span = max(row['diversity'] for row in val_rows) - min(row['diversity'] for row in val_rows)
+    if max(ndcg_span, health_span, div_span) < 1e-4:
+        logger.warning('Validation metrics are nearly identical across weight vectors; conditional policy may not be responding to w.')
+
+    val_csv_path = os.path.join(args.output_dir, 'validation_weight_grid.csv')
+    with open(val_csv_path, 'w', encoding='utf-8', newline='') as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(val_rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(val_rows)
+    logger.info('Validation grid saved to %s', val_csv_path)
+
+    if tracker is not None:
+        tracker.log(
+            {
+                'val/ndcg_span': ndcg_span,
+                'val/health_span': health_span,
+                'val/diversity_span': div_span,
+                'val/median_diversity': median_div,
+            }
+        )
+        tracker.log_table(
+            name='val/weight_grid',
+            rows=[[row[key] for key in val_rows[0].keys()] for row in val_rows],
+            columns=list(val_rows[0].keys()),
+        )
+
+    logger.info(
+        'Selected w* = [%.3f, %.3f, %.3f] (val score=%.4f)',
+        best_w[0].item(),
+        best_w[1].item(),
+        best_w[2].item(),
+        best_score,
+    )
 
     # ------------------------------------------------------------------
     # Final evaluation on test split
     # ------------------------------------------------------------------
-    print("\n[Final] Evaluating MORL on test split ...")
+    logger.info('[Final] Evaluating MORL on test split')
     test_metrics = evaluate_morl(
         policy=policy,
         user_emb=user_emb,
@@ -225,9 +368,14 @@ def main():
         device=device,
     )
 
-    print("\n=== Test Results (MORL, sequential, w*) ===")
+    logger.info('=== Test Results (MORL, sequential, w*) ===')
     for k, v in test_metrics.items():
-        print(f"  {k}: {v:.5f}")
+        logger.info('  %s: %.5f', k, v)
+        append_jsonl(eval_path, {'type': 'test_metric', 'metric': k, 'value': float(v)})
+
+    if tracker is not None:
+        tracker.log({f'test/{key}': value for key, value in test_metrics.items()})
+        tracker.log({'test/best_w_pref': best_w[0].item(), 'test/best_w_health': best_w[1].item(), 'test/best_w_div': best_w[2].item()})
 
     # Save results
     results_path = os.path.join(args.output_dir, 'test_results.pt')
@@ -236,7 +384,8 @@ def main():
         'test_metrics': test_metrics,
         'val_grid_results': [(w.tolist(), m) for w, m in all_val_results],
     }, results_path)
-    print(f"\nResults saved to {results_path}")
+    logger.info('Results saved to %s', results_path)
+    tracker.finish()
 
 
 if __name__ == '__main__':
