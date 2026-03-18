@@ -15,5 +15,6 @@ dependencies:
   - pyg
   - pytorch-sparse
   - pip
+  - scikit-learn
   - pip:
       - wandb
