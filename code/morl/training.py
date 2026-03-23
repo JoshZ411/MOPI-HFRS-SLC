@@ -9,7 +9,7 @@ import logging
 import math
 import os
 from itertools import combinations
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple, cast
 
 import torch
 import torch.optim as optim
@@ -48,8 +48,9 @@ def run_episode(
         if not remaining:
             break
 
-        action, log_prob, info = policy.select_action(
-            state, weight, remaining, num_candidates, return_info=True
+        action, log_prob, info = cast(
+            Tuple[int, torch.Tensor, Dict[str, float]],
+            policy.select_action(state, weight, remaining, num_candidates, return_info=True),
         )
         state, reward, done = env.step(action)
         state = state.to(device)
@@ -75,11 +76,11 @@ def run_episode(
     return log_probs, rewards, diagnostics
 
 
-def _safe_mean(values: List[float]) -> float:
+def _safe_mean(values: Sequence[float]) -> float:
     return sum(values) / len(values) if values else 0.0
 
 
-def _safe_std(values: List[float]) -> float:
+def _safe_std(values: Sequence[float]) -> float:
     if len(values) <= 1:
         return 0.0
     mean_value = _safe_mean(values)
@@ -131,11 +132,14 @@ def probe_weight_sensitivity(
             'probe_first_action_span': 0.0,
         }
 
+    # 6-point probe set: 3 corners + uniform + 2 interior points.
     probe_weights = [
         torch.tensor([1.0, 0.0, 0.0], device=device),
         torch.tensor([0.0, 1.0, 0.0], device=device),
         torch.tensor([0.0, 0.0, 1.0], device=device),
         torch.tensor([1 / 3, 1 / 3, 1 / 3], device=device),
+        torch.tensor([0.6, 0.3, 0.1], device=device),
+        torch.tensor([0.1, 0.6, 0.3], device=device),
     ]
     pairwise_jaccard: List[float] = []
     unique_item_ratios: List[float] = []
@@ -151,7 +155,10 @@ def probe_weight_sensitivity(
                     remaining = env.remaining
                     if not remaining:
                         break
-                    action, _ = policy.select_action(state, weight, remaining, num_candidates, greedy=True)
+                    action, _ = cast(
+                        Tuple[int, torch.Tensor],
+                        policy.select_action(state, weight, remaining, num_candidates, greedy=True),
+                    )
                     if not env.selected:
                         first_actions.append(action)
                     state, _, done = env.step(action)
@@ -204,6 +211,10 @@ def train_morl(
     tracker: Optional[Any] = None,
     probe_user_ids: Optional[List[int]] = None,
     probe_every: int = 10,
+    failfast_enabled: bool = True,
+    failfast_patience: int = 3,
+    failfast_span_threshold: float = 0.5,
+    failfast_jaccard_threshold: float = 0.95,
     device: Optional[torch.device] = None,
 ) -> ConditionalPolicy:
     """Train the MORL conditional policy.
@@ -289,14 +300,18 @@ def train_morl(
     probe_user_ids = (probe_user_ids or [])[: min(len(probe_user_ids or []), 4)]
 
     logger.info(
-        'Starting MORL training: epochs=%d batch_size=%d K=%d M=%d lr=%.4g hidden_dim=%d',
+        'Starting MORL training: epochs=%d batch_size=%d K=%d M=%d lr=%.4g hidden_dim=%d failfast=%s',
         num_epochs,
         batch_size,
         K,
         M,
         lr,
         hidden_dim,
+        str(failfast_enabled),
     )
+
+    failfast_streak = 0
+    final_epoch = 0
 
     for epoch in range(1, num_epochs + 1):
         policy.train()
@@ -341,7 +356,7 @@ def train_morl(
             episode_loss = -sum(log_probs) * advantage
             policy_loss_terms.append(episode_loss)
 
-        policy_loss = sum(policy_loss_terms) / len(batch_users)
+        policy_loss = torch.stack(policy_loss_terms).mean()
         optimizer.zero_grad()
         policy_loss.backward()
         grad_norm = _grad_norm(policy)
@@ -369,7 +384,7 @@ def train_morl(
             'mean_entropy': _safe_mean(entropies),
             'mean_selected_prob': _safe_mean(selected_probs),
             'mean_max_prob': _safe_mean(max_probs),
-            'mean_action_position': _safe_mean(selected_positions),
+            'mean_action_position': _safe_mean([float(position) for position in selected_positions]),
             'std_action_position': _safe_std([float(position) for position in selected_positions]),
             'grad_norm': grad_norm,
             'weight_pref_mean': _safe_mean(weight_pref),
@@ -402,6 +417,31 @@ def train_morl(
                     probe_stats['probe_first_action_span'],
                     probe_stats['probe_pairwise_jaccard'],
                 )
+
+            if (
+                failfast_enabled
+                and probe_stats['probe_first_action_span'] < failfast_span_threshold
+                and probe_stats['probe_pairwise_jaccard'] >= failfast_jaccard_threshold
+            ):
+                failfast_streak += 1
+            else:
+                failfast_streak = 0
+
+            if failfast_enabled and failfast_streak >= failfast_patience:
+                logger.warning(
+                    'Fail-fast triggered at epoch %d after %d stagnant probe checks (span<%.3f and jaccard>=%.3f).',
+                    epoch,
+                    failfast_streak,
+                    failfast_span_threshold,
+                    failfast_jaccard_threshold,
+                )
+                final_epoch = epoch
+                stats.append(epoch_stats)
+                if metrics_path is not None:
+                    append_jsonl(metrics_path, {'type': 'train_epoch', **epoch_stats})
+                if tracker is not None:
+                    tracker.log({f'train/{key}': value for key, value in epoch_stats.items()}, step=epoch)
+                break
 
         stats.append(epoch_stats)
 
@@ -443,10 +483,12 @@ def train_morl(
             )
             logger.info('Saved checkpoint: %s', ckpt_path)
 
+        final_epoch = epoch
+
     # Final checkpoint
     final_path = os.path.join(checkpoint_dir, 'morl_policy_final.pt')
     torch.save(
-        {'epoch': num_epochs,
+        {'epoch': final_epoch if final_epoch > 0 else num_epochs,
          'policy_state_dict': policy.state_dict(),
          'optimizer_state_dict': optimizer.state_dict(),
          'stats': stats},
@@ -514,8 +556,9 @@ def evaluate_morl(
                 remaining = env.remaining
                 if not remaining:
                     break
-                action, _ = policy.select_action(
-                    state, w, remaining, M, greedy=True
+                action, _ = cast(
+                    Tuple[int, torch.Tensor],
+                    policy.select_action(state, w, remaining, M, greedy=True),
                 )
                 state, _, done = env.step(action)
                 state = state.to(dev)

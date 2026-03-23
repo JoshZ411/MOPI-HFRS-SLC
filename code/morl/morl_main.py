@@ -92,12 +92,33 @@ def main():
     parser.add_argument('--M', type=int, default=200, help='Candidate pool size.')
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--hidden_dim', type=int, default=256)
+    parser.add_argument('--disable_failfast', action='store_true',
+                        help='Disable probe-based fail-fast guardrail in training.')
+    parser.add_argument('--failfast_patience', type=int, default=3,
+                        help='Number of consecutive stagnant probe checks before early stopping.')
+    parser.add_argument('--failfast_span_threshold', type=float, default=0.5,
+                        help='Fail-fast span threshold: first_action_span must exceed this to count as progress.')
+    parser.add_argument('--failfast_jaccard_threshold', type=float, default=0.95,
+                        help='Fail-fast jaccard threshold: pairwise_jaccard must drop below this to count as progress.')
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--output_dir', type=str, default='morl_output')
     parser.add_argument('--device', type=str, default='auto',
                         help='Device to run on: auto, cpu, cuda, or cuda:N.')
     parser.add_argument('--val_weight_alpha', type=float, default=0.7,
                         help='Weight for NDCG in w* selection (1-alpha → health).')
+    parser.add_argument(
+        '--val_selection_mode',
+        type=str,
+        default='unconstrained',
+        choices=['constrained', 'unconstrained', 'soft-constrained'],
+        help='Validation weight selection mode: constrained uses diversity threshold; unconstrained maximizes alpha*ndcg + (1-alpha)*health directly; soft-constrained applies a diversity shortfall penalty.',
+    )
+    parser.add_argument(
+        '--val_diversity_penalty_lambda',
+        type=float,
+        default=0.5,
+        help='Penalty weight for soft-constrained mode: score -= lambda * max(0, target_diversity - diversity).',
+    )
     parser.add_argument('--log_every', type=int, default=10,
                         help='Epoch interval for training log summaries.')
     parser.add_argument('--probe_every', type=int, default=10,
@@ -240,6 +261,10 @@ def main():
         tracker=tracker,
         probe_user_ids=probe_users,
         probe_every=args.probe_every,
+        failfast_enabled=not args.disable_failfast,
+        failfast_patience=args.failfast_patience,
+        failfast_span_threshold=args.failfast_span_threshold,
+        failfast_jaccard_threshold=args.failfast_jaccard_threshold,
         device=device,
     )
 
@@ -250,6 +275,10 @@ def main():
     weight_grid = simplex_grid(n_points=15)
     best_score = -1.0
     best_w = weight_grid[3]  # uniform default
+    best_unconstrained_score = -1.0
+    best_unconstrained_w = weight_grid[3]
+    best_constrained_score = -1.0
+    best_constrained_w = weight_grid[3]
 
     logger.info('%8s %9s %7s | %8s %8s %8s | %8s', 'w_pref', 'w_health', 'w_div', 'NDCG', 'Health', 'Div', 'score')
     logger.info('%s', '-' * 68)
@@ -280,12 +309,23 @@ def main():
 
     for w, metrics in all_val_results:
         wp, wh, wd = w[0].item(), w[1].item(), w[2].item()
+        unconstrained_score = args.val_weight_alpha * metrics['ndcg'] + \
+                     (1 - args.val_weight_alpha) * metrics['health_score']
+        diversity_shortfall = max(0.0, median_div - metrics['diversity'])
+        soft_constrained_score = unconstrained_score - args.val_diversity_penalty_lambda * diversity_shortfall
+
         # Option A: maximise α·NDCG + (1-α)·Health  s.t. Diversity ≥ median_div
         if metrics['diversity'] >= median_div:
-            score = args.val_weight_alpha * metrics['ndcg'] + \
-                    (1 - args.val_weight_alpha) * metrics['health_score']
+            constrained_score = unconstrained_score
         else:
-            score = -1.0
+            constrained_score = -1.0
+
+        if args.val_selection_mode == 'constrained':
+            score = constrained_score
+        elif args.val_selection_mode == 'unconstrained':
+            score = unconstrained_score
+        else:
+            score = soft_constrained_score
         row = {
             'w_pref': wp,
             'w_health': wh,
@@ -294,6 +334,10 @@ def main():
             'health_score': metrics['health_score'],
             'diversity': metrics['diversity'],
             'recall': metrics['recall'],
+            'unconstrained_score': unconstrained_score,
+            'constrained_score': constrained_score,
+            'soft_constrained_score': soft_constrained_score,
+            'diversity_shortfall': diversity_shortfall,
             'score': score,
             'passes_diversity_constraint': metrics['diversity'] >= median_div,
         }
@@ -309,6 +353,15 @@ def main():
             metrics['diversity'],
             score,
         )
+
+        if unconstrained_score > best_unconstrained_score:
+            best_unconstrained_score = unconstrained_score
+            best_unconstrained_w = w
+
+        if constrained_score > best_constrained_score:
+            best_constrained_score = constrained_score
+            best_constrained_w = w
+
         if score > best_score:
             best_score = score
             best_w = w
@@ -342,7 +395,19 @@ def main():
         )
 
     logger.info(
-        'Selected w* = [%.3f, %.3f, %.3f] (val score=%.4f)',
+        'Selection mode=%s | constrained best=[%.3f, %.3f, %.3f] score=%.4f | unconstrained best=[%.3f, %.3f, %.3f] score=%.4f',
+        args.val_selection_mode,
+        best_constrained_w[0].item(),
+        best_constrained_w[1].item(),
+        best_constrained_w[2].item(),
+        best_constrained_score,
+        best_unconstrained_w[0].item(),
+        best_unconstrained_w[1].item(),
+        best_unconstrained_w[2].item(),
+        best_unconstrained_score,
+    )
+    logger.info(
+        'Selected w* = [%.3f, %.3f, %.3f] (active mode score=%.4f)',
         best_w[0].item(),
         best_w[1].item(),
         best_w[2].item(),

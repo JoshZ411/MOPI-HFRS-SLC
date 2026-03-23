@@ -1,16 +1,16 @@
 """
 Conditional policy network π(a | s, w) for MORL sequential recommendation.
 
-The policy takes a concatenation of the environment state s_t and the
-preference weight vector w ∈ Δ² (the 2-dimensional probability simplex
-embedded in ℝ³, where weights sum to 1) as input and produces a probability
-distribution over the current candidate pool.
+The policy encodes the environment state s_t and builds separate objective
+logits for preference, health, and diversity. The final action logits are a
+weighted sum of those objective-specific logits using w ∈ Δ².
 
 Architecture:
-    input  : concat(s_t, w)  — (state_dim + 3,)
-    → Linear → ReLU
-    → Linear → ReLU
-    → Linear → logits over full candidate pool (M,)
+    state encoder: s_t → Linear → ReLU → Linear → ReLU
+    objective heads:
+        logits_pref(s_t), logits_health(s_t), logits_div(s_t)
+    composition:
+        logits = w_pref*logits_pref + w_health*logits_health + w_div*logits_div
     → mask already-selected items (set to −∞)
     → Softmax → action probabilities
 """
@@ -50,14 +50,15 @@ class ConditionalPolicy(nn.Module):
         self.num_candidates = num_candidates
         self.weight_dim = weight_dim
 
-        input_dim = state_dim + weight_dim
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
+        self.state_encoder = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, num_candidates),
         )
+        self.pref_head = nn.Linear(hidden_dim, num_candidates)
+        self.health_head = nn.Linear(hidden_dim, num_candidates)
+        self.div_head = nn.Linear(hidden_dim, num_candidates)
 
     def forward(
         self,
@@ -90,8 +91,17 @@ class ConditionalPolicy(nn.Module):
             if mask is not None:
                 mask = mask.unsqueeze(0)
 
-        x = torch.cat([state, weight], dim=-1)
-        logits = self.net(x)  # (batch, num_candidates)
+        state_hidden = self.state_encoder(state)  # (batch, hidden_dim)
+
+        logits_pref = self.pref_head(state_hidden)
+        logits_health = self.health_head(state_hidden)
+        logits_div = self.div_head(state_hidden)
+
+        # Enforce weight-conditioning by construction at the logit level.
+        w_pref = weight[:, 0].unsqueeze(-1)
+        w_health = weight[:, 1].unsqueeze(-1)
+        w_div = weight[:, 2].unsqueeze(-1)
+        logits = w_pref * logits_pref + w_health * logits_health + w_div * logits_div
 
         if mask is not None:
             logits = logits.masked_fill(~mask, float('-inf'))
