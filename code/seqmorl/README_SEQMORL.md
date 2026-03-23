@@ -136,6 +136,14 @@ python seqmorl/seqmorl_main.py \
     --K 20 \
     --lr 1e-3 \
     --output_dir seqmorl_output
+
+# Quick smoke run (limits per-epoch rollout users for speed)
+python seqmorl/seqmorl_main.py \
+    --device cpu \
+    --epochs 5 \
+    --train_user_limit 256 \
+    --val_user_limit 256 \
+    --output_dir seqmorl_output_smoke
 ```
 
 ### GPU cluster (e.g. A100)

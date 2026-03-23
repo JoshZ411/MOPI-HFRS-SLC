@@ -167,6 +167,10 @@ def main():
                         help='Enable W&B offline logging.')
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed.')
+    parser.add_argument('--train_user_limit', type=int, default=0,
+                        help='Optional cap on number of train users per epoch (0 = all).')
+    parser.add_argument('--val_user_limit', type=int, default=0,
+                        help='Optional cap on number of val users used during training diagnostics (0 = all).')
     args = parser.parse_args()
 
     # --- Device setup ---
@@ -200,6 +204,16 @@ def main():
     train_users = train_edge_index[0].unique().tolist()
     val_users = val_edge_index[0].unique().tolist()
     test_users = test_edge_index[0].unique().tolist()
+
+    if args.train_user_limit and args.train_user_limit > 0:
+        train_users = train_users[:args.train_user_limit]
+    if args.val_user_limit and args.val_user_limit > 0:
+        val_users = val_users[:args.val_user_limit]
+
+    print(
+        f"[seqmorl] User split sizes: train={len(train_users)} "
+        f"val={len(val_users)} test={len(test_users)}"
+    )
 
     # --- Build environment ---
     env = SequentialRecEnv(

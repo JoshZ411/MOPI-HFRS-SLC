@@ -68,7 +68,9 @@ class SequentialPolicy(nn.Module):
             entropy  (torch.Tensor) : Distribution entropy.
         """
         logits = self.forward(state, action_mask)
-        dist = Categorical(logits=logits)
+        # This distribution is built at every rollout step; skip repeated
+        # argument validation for a substantial speed-up in CPU smoke runs.
+        dist = Categorical(logits=logits, validate_args=False)
         if greedy:
             action = logits.argmax(dim=-1)
         else:

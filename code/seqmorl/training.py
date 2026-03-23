@@ -249,6 +249,7 @@ def train_implicit_morl(policy: SequentialPolicy,
 
     for epoch in range(args.epochs):
         policy.train()
+        print(f"[seqmorl][epoch {epoch}] collecting rollouts for {len(train_user_ids)} users ...")
         rollout = collect_rollouts(policy, env, train_user_ids, args.gamma)
         if rollout is None:
             print(f"[Epoch {epoch}] No rollout data — skipping.")
