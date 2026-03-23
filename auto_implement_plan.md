@@ -1,336 +1,474 @@
-# MO-DQN Sequential MORL Pivot Automation Plan
+# Implicit Sequential MORL Pivot Automation Plan
 
 You are an AI coding agent operating inside the MOPI-HFRS repository.
 
-Your objective is to augment the MOPI-HFRS pipeline by adding a sequential MORL recommendation stage that operates on frozen embeddings post-training, without modifying the SGSL training phase.
+Your objective is to augment the original MOPI-HFRS pipeline with a sequential recommendation stage that remains consistent with original one-shot inference semantics:
+- no user-provided tradeoff vector,
+- one deployed scoring policy at inference,
+- multi-objective balancing handled implicitly during training.
 
-CRITICAL CONSTRAINTS:
-- DO NOT modify SGSL backbone, graph preprocessing, or health tag enrichment.
-- DO NOT alter GNN training loop or pareto_loss (MGDA gradient balancing).
-- DO NOT modify main.py training mechanics.
-- SGSL + MGDA training completes unchanged; embeddings are frozen for RL.
-- MORL replaces the inference-time recommendation mechanism (one-shot Pareto ranking → sequential list construction).
+This pivot implements an implicit multi-objective sequential RL design (no explicit weight conditioning) that uses MGDA-style gradient combination at update time.
 
-Pipeline architecture:
-```
-SGSL Training (MGDA multi-obj balancing) 
-    → Frozen user/item embeddings 
-    → MORL sequential list construction
-    → Evaluation: baseline (one-shot) vs MORL (sequential)
-```
+## CRITICAL CONSTRAINTS
 
----
-
-# IMPLEMENTATION ARCHITECTURE: Inference-Time Augmentation
-
-**Goal:** Replace one-shot Pareto ranking with sequential MORL policy at recommendation time; leave training phase untouched.
-
-**Workflow:**
-1. Run `python main.py` normally: SGSL trains with MGDA multi-objective loss balancing (unchanged).
-2. After training completes: extract frozen embeddings to checkpoint.
-3. Create separate MORL training pipeline in `/code/morl/` that loads frozen embeddings.
-4. MORL trains conditional policy π(a|s,w) on frozen embeddings.
-5. Evaluation: 
-   - Baseline: one-shot Pareto-optimal ranking from main.py eval
-   - MORL: sequential K-step list construction using trained policy
-   - Compare metrics on same frozen embeddings.
-
-**No modifications to main.py training loop or pareto_loss.**
-
-**Code organization:**
-```
-code/
-  main.py (unchanged; adds one line: embedding checkpoint save)
-  morl/
-    environment.py (RL environment)
-    policy.py (conditional policy network)
-    training.py (MORL training loop)
-    morl_main.py (entry point)
-  RCSYS_*.py (unchanged)
-  utils.py (reused for evaluation)
-```
-
-**Contribution framing:**
-- **MGDA:** gradient-space multi-objective compromise during GNN training (learning phase).
-- **MORL:** policy-space horizon-aware trade-off allocation during recommendation (inference phase).
-Both operate on identical frozen embeddings.
+- DO NOT modify SGSL backbone architecture.
+- DO NOT modify graph preprocessing or health tag enrichment.
+- DO NOT alter core MGDA mechanics in existing GNN training (`pareto_loss`, min-norm solver logic).
+- DO NOT require any inference-time preference/tradeoff vector input.
+- Build new sequential modules from scratch in a new package path.
+- Sequential training/inference MUST support both CPU and CUDA via runtime toggle (`--device cpu|cuda|auto`) without code changes.
 
 ---
 
-# KEY ASSUMPTIONS & DESIGN CHOICES
+## MANDATORY PREREQUISITE: Deep Codebase Understanding
 
-Before implementation, lock these decisions:
+**BEFORE starting any implementation, you MUST thoroughly read and understand the following:**
 
-**GPU:** A100 will be available. Default to `device="cuda"` throughout.
+1. **Original MGDA Framework (SGSL Training)**
+   - Read `code/main.py` end-to-end: understand SGSL training loop, checkpoint flow, baseline evaluation.
+   - Read `code/RCSYS_utils.py` lines 514–551 (pareto_loss pattern): how multi-objective gradients are aggregated, how objectives are defined (BPR, health, diversity).
+   - Read `code/min_norm_solvers.py`: MinNormSolver algorithm, gradient normalization utilities, how the solver produces convex combination coefficients.
+   - Read `code/RCSYS_models.py`: SGSL model architecture, embedding dimensions, forward pass semantics.
+   - Document in your implementation notes: exact line-by-line flow of a multi-objective training step in the original framework.
 
-**Embedding freezing:** GNN training completes; user/item embeddings are frozen (no backprop during RL).
+2. **Existing Evaluation and Metrics Pipeline**
+   - Read how baseline SGSL evaluates on val/test splits: metrics computation (NDCG, recall, health, diversity) in `code/main.py`.
+   - Document: what metrics are used, how they are computed, where in code they are defined.
 
-**Candidate pool size M:** Top-M items per user governs action space size.
-- Current baseline: TBD (recommend 100–200 items; will tune based on memory).
-- Pools computed once at start; reused across entire RL training.
+3. **W&B Logging Patterns (from prior sequential RL experiments)**
+   
+   You MUST implement W&B logging that tracks these per-epoch metrics during implicit MORL training:
+   
+   **Per-objective metrics (pref, health, div):**
+   - `train/mean_reward_X` and `train/std_reward_X`: objective performance and variance per epoch
+   - `train/objective_grad_norm_X`: gradient magnitude BEFORE L2 normalization (shows raw objective strength)
+   - `train/mgda_coeff_X`: MGDA solver coefficients per objective (PRIMARY collapse detector - watch for any > 0.95)
+   - `train/cumulative_advantage_X`: per-objective advantage signal (should increase if learning, plateau = collapse)
+   
+   **Aggregate metrics:**
+   - `train/policy_loss`: combined policy gradient loss per epoch
+   - `train/grad_norm`: gradient norm AFTER MGDA combination
+   - `train/objective_dominance_ratio`: max(mgda_coeffs) / min(mgda_coeffs) - **CRITICAL**: if sustained > 10 for 50+ epochs = prior MORL failure recurrence
+   - `train/mean_entropy`: action distribution entropy - **CRITICAL**: if drops below 0.05 = mode collapse (prior failure)
+   - `train/mean_action_position`: which positions in candidate pool being selected
+   
+   **Probing diagnostics (every 25 epochs):**
+   - `train/probe_first_action_span`: action variation across users - **CRITICAL**: if near 0 = prior MORL failure symptom
+   - `train/probe_pairwise_jaccard`: action set diversity
+   
+   **Implementation:** Create a WandbTracker class (optional, can be toggled off) that wraps wandb.init() with offline mode and generates leet command:
+   
+   ```python
+   tracker = WandbTracker(enabled=True, project='seqmorl-implicit', mode='offline', 
+                         base_dir=output_dir, config=args)
+   # Each epoch in training loop:
+   tracker.log({f'train/{key}': value for key, value in epoch_stats.items()}, step=epoch)
+   # At end of training:
+   leet_cmd = tracker.leet_command()  # e.g., "python -m wandb beta leet run ..."
+   save_json(os.path.join(output_dir, 'wandb_leet_command.txt'), {'command': leet_cmd})
+   ```
 
-**Reward aggregation:** Per-step rewards [r_pref, r_health, r_div] are scalarized only for policy gradient updates.
-- Storage: environment returns full 3-dim vector.
-- Validation: evaluate all three objectives independently.
+**Verification checklist (do NOT skip):**
+- [ ] Can you explain the full forward/backward pass of a multi-objective SGSL training step in `code/main.py`?
+- [ ] Can you explain why the implicit MORL design avoids the prior failure mode: no explicit weight conditioning means weight-dominance bottleneck cannot exist?
+- [ ] Can you implement a WandbTracker class that logs metrics with offline mode support and generates `wandb beta leet run` command?
+- [ ] Can you identify the THREE critical W&B diagnostics that catch prior MORL failure modes: objective_dominance_ratio (should stay < 2), action_entropy (should stay > 0.5), probe_first_action_span (should not be 0)?
 
-**Tag encoding:** Binary union vector (|food_tags| dimensions); cumulative OR operation during episode.
+**If you cannot answer all four with specific design rationale and W&B metrics, DO NOT proceed. The implicit design is fundamentally different from weight-conditioned MORL - must understand why first.**
 
-**State dimensionality:** d_user + d_user + |food_tags| + 1 = 2·d_aggregated + tag_dim + 1.
+## Pipeline architecture
 
-**Batch sampling:** Small batch (32–64 users) sufficient for discrete action space; no memory bottleneck on A100s expected.
+SGSL Training (existing MGDA multi-objective balancing)
+-> Frozen user/item embeddings
+-> Implicit Sequential MORL training (no explicit w)
+-> Single-policy evaluation on val/test
+-> Baseline (one-shot) vs Sequential (list-wise) comparison
 
-**Evaluation protocol:** Standard train/val/test split (60/20/20); exclude seen training interactions from ranking at test time.
+Implementation contract:
+- Sequential stage is an inference-time augmentation on top of frozen embeddings, not a replacement for SGSL training.
+- SGSL training phase remains unchanged; only a minimal embedding checkpoint handshake is allowed.
+- Baseline and sequential policy must be compared on identical splits and identical frozen embeddings.
 
 ---
 
-MGDA provides a locally Pareto-feasible gradient direction (myopic compromise). We aim to learn long-horizon policies that approximate the achievable trade-offs of sequential recommenders.
+## Why this design is chosen (lessons from prior experiments)
 
-Instead of selecting a single compromise during training (as MGDA does), we train a conditional policy that can model different trade-offs over full K-step recommendation trajectories.
+Prior experiments surfaced several issues that this design must avoid:
 
-Final operating point selection will be done via validation metrics.
+1. Inference mismatch with product intent.
+The explicit framework required tradeoff vectors and post-training weight selection (`w*`), while intended behavior is one-shot per-user inference without preference input.
+
+2. Conditioning collapse risk.
+Weight-conditioned policy behavior collapsed in some runs (`first_action_span` near zero), indicating unstable dependence on explicit weight inputs.
+
+3. Coarse operating-point selection.
+Validation weight-grid search introduced an additional selector bottleneck that could mask policy learning and produce corner solutions.
+
+4. High-variance scalarized REINFORCE signal.
+Sampling weights and scalarizing returns per episode increased variance and made optimization less stable.
+
+This plan removes those failure modes by making objective balancing implicit in optimization (MGDA-style gradient combination across objective-specific policy gradients).
 
 ---
 
-# PHASE 1: Embedding Extraction (Post-Training)
+## Existing code references to reuse
 
-Goal: Save frozen embeddings after SGSL training completes; prepare for MORL.
+Primary reference files in the original framework:
 
-Step 1: Verify SGSL/MGDA training completes normally.
-- Run standard `python main.py`.
-- No modifications to training loop or pareto_loss.
-- MGDA gradient balancing operates as designed.
+- `code/main.py`
+  - Existing SGSL training and evaluation orchestration.
+  - Keep one-shot baseline path intact for comparison.
 
-Step 2: Add minimal checkpoint save.
-- After training completes (after test eval), save frozen embeddings.
-- One-line addition to main.py (post-training, no loop changes):
-  ```python
-  torch.save({'user_emb': users_emb_final.detach().cpu(), 
-              'item_emb': items_emb_final.detach().cpu()}, 
-             'embeddings_checkpoint.pt')
-  ```
+- `code/RCSYS_utils.py`
+  - `pareto_loss` pattern for multi-objective gradient aggregation.
+  - Existing objective definitions and evaluation helpers.
 
-Step 3: Create MORL entry point in `morl/morl_main.py`.
-- Load frozen embeddings from checkpoint.
-- Load user/item health tags.
-- Proceed to Phases 2–6 (environment, policy, training).
+- `code/min_norm_solvers.py`
+  - `MinNormSolver.find_min_norm_element_FW`.
+  - `gradient_normalizers` for scale balancing.
 
-SGSL training pipeline completely untouched. MORL operates entirely post-hoc on frozen embeddings.
+- `code/RCSYS_models.py`, `code/utils.py`
+  - Existing embedding and metric ecosystem; do not redesign unless required.
+
+These references define the intended implicit balancing philosophy and must guide sequential RL update design.
+
+---
+
+## New code organization (clean branch assumption: no `code/morl`)
+
+Create a new package:
+
+- `code/seqmorl/`
+  - `__init__.py`
+  - `environment.py`
+  - `policy.py`
+  - `training.py`
+  - `evaluation.py`
+  - `seqmorl_main.py`
+  - `README_SEQMORL.md`
+
+Keep this new package fully decoupled from SGSL training internals except for reading frozen embeddings and graph/tag artifacts.
+
+---
+
+## IMPLEMENTATION PHASES
+
+## Phase 0: Scope lock and baseline contract
+
+Goal: lock behavior and establish W&B instrumentation with failure-mode detection.
+
+Steps:
+1. Confirm baseline one-shot SGSL metrics pipeline is unchanged and runnable.
+2. Define hard acceptance criteria:
+   - no inference-time tradeoff input,
+   - one trained sequential policy,
+   - improved or competitive list-level utility versus one-shot baseline,
+   - stable implicit multi-objective balancing (MGDA coefficients balanced, no single objective > 0.9 consistently).
+3. Add cross-hardware execution contract (laptop CPU and cluster GPU):
+   - Add CLI flag `--device` to `seqmorl_main.py` with choices: `cpu`, `cuda`, `auto`.
+   - Implement `resolve_device()` behavior:
+     - `auto`: use CUDA if available, else CPU.
+     - `cpu`: force CPU execution.
+     - `cuda`: require CUDA; fail with clear message if unavailable.
+   - Ensure tensors, model, and rollout buffers are moved consistently to resolved device.
+   - Keep checkpoint format portable so CPU can load checkpoints trained on GPU (`map_location` handling).
+4. Validate parity by running smoke tests in both modes:
+   - local laptop: `--device cpu`
+   - cluster/A100: `--device cuda`
+   - verify both modes produce train/eval logs and W&B curves without device mismatch errors.
+5. Implement W&B infrastructure:
+   - Create `code/seqmorl/logging_utils.py` with WandbTracker class (offline mode, leet command generation).
+   - Project: `seqmorl-implicit`. All runs log offline for `wandb beta leet` reproducibility.
+   - Store leet command in output_dir/wandb_leet_command.txt.
+6. Define W&B metrics and collapse detection (from W&B Logging Patterns section above):
+   - Per-objective: reward, gradient norm, MGDA coefficients, cumulative advantage.
+   - Aggregate: policy_loss, action_entropy, objective_dominance_ratio.
+   - Probing (every 25 epochs): first_action_span (MUST NOT be 0), pairwise_jaccard.
+   - **Guardrails**: objective_dominance_ratio > 10 for 50+ epochs → PAUSE (prior MORL failure). action_entropy < 0.05 → PAUSE (mode collapse). probe_first_action_span ≈ 0 → PAUSE (prior failure).
+7. Log all metrics to local JSONL and W&B.
 
 Deliverable:
-    - `embeddings_checkpoint.pt` saved after SGSL training.
-    - MORL module loads checkpoint; trains policy independently.
-    - main.py remains functionally equivalent (one save call added at end).
+- Acceptance gates document.
+- WandbTracker implementation with offline mode and leet command support.
+- First training run produces valid W&B offline run with all metrics accessible via leet command.
+- CPU and CUDA smoke-test run records captured in `auto_logs.md`.
 
 ---
 
-# PHASE 2: Candidate Pool Construction
+## Phase 1: Embedding extraction handshake (minimal SGSL touch)
 
-Goal: Define discrete action space for sequential MDP.
+Goal: ensure frozen embeddings are available to sequential stage.
 
-Step 1: Generate candidate pools per user.
-- Use baseline scoring: score = user_emb · item_emb^T
-- Select top-M items per user (M ∈ {100, 200, 500}; TBD based on memory/runtime).
-- Clarification: Do NOT exclude training positives from pools during RL training
-  (GNN is frozen; RL explores all top-M rankings).
-- At evaluation/test time, exclude training/validation edges per standard protocol.
+Steps:
+1. Reuse existing SGSL training flow in `code/main.py`.
+2. If not already present, add a minimal post-training checkpoint save:
+   - `user_emb`, `item_emb` (cpu tensors),
+   - optional metadata (`seed`, `hidden_dim`, split identifiers).
+3. Save as `code/embeddings_checkpoint.pt`.
 
-Step 2: Store candidate pools.
-- Pools remain fixed during RL training.
-- No dynamic re-ranking at this stage.
+Constraints:
+- No changes to SGSL training loop mechanics.
+- No changes to `pareto_loss` behavior.
 
 Deliverable:
-    candidate_pools[user_id] → list of M item_ids
+- Deterministic checkpoint output consumed by `seqmorl_main.py`.
 
 ---
 
-# PHASE 3: MDP Definition (Sequential List Construction)
+## Phase 2: Sequential environment and candidate pool
 
-Goal: Formalize deterministic environment.
+Goal: define deterministic top-K construction MDP with fixed candidate pools.
 
-State s_t:
-    - user embedding (d-dim)
-    - aggregated embedding of selected items: mean pooling over [i_1, ..., i_{t-1}] (initialized to zero vector at t=0)
-    - cumulative health tag coverage: binary vector encoding union of selected items' tags
-    - normalized timestep t/K
+Steps:
+1. Build top-M candidate pools per user from frozen embeddings (dot-product score).
+2. Environment state at step t:
+   - user embedding,
+   - aggregate embedding of selected items,
+   - cumulative tag coverage,
+   - normalized timestep t/K.
+3. Action:
+   - select one item from remaining candidate slots.
+4. Transition:
+   - append item,
+   - update aggregate embedding,
+   - update coverage,
+   - advance timestep.
+5. Episode ends at K selections or empty pool.
 
-Action:
-    - select next item from candidate pool (masked to prevent duplicates).
-    - Terminal state masking: if candidate pool exhausted (|remaining| = 0), 
-      terminate episode early.
+Design notes:
+- Start with M around 200 (avoid very large M degeneracy observed before).
+- Candidate pools are computed once at startup and reused across training (no dynamic reranking in baseline implementation).
+- Tag coverage state uses binary union (bitwise OR) over selected item tags.
+- State dimensionality should be documented explicitly as: user_dim + item_agg_dim + tag_dim + 1.
+- Keep reward channels explicit but do not pass tradeoff vectors into policy.
 
-Transition:
-    - append selected item to list
-    - update aggregated embedding via mean update
-    - update tag union (bitwise OR of item tags)
-    - increment timestep t → t+1
-
-Episode ends after K selections (K=20 per baseline).
+Evaluation masking protocol:
+- During evaluation, exclude seen interactions from ranking according to split protocol (train interactions for val/test; plus val interactions when evaluating test if that is the repo baseline rule).
+- Keep masking behavior consistent between one-shot baseline and sequential policy evaluation.
 
 Deliverable:
-    Deterministic K-step list-construction environment with state/action/transition specs.
+- `code/seqmorl/environment.py` with deterministic step/reset API.
 
 ---
 
-# PHASE 4: Multi-Objective Reward Structure
+## Phase 3: Policy architecture (implicit objective balancing compatible)
 
-Goal: Define interpretable, decomposed reward signals.
+Goal: single policy that consumes state only and outputs logits over candidate actions.
 
-Per-step reward components:
-    r_pref_t:
-        Based on preference loss (BPR-style ranking).
-        Computed from interactions between user_emb and selected item_emb.
-    r_health_t:
-        Jaccard similarity between cumulative tag coverage and user profile tags.
-    r_div_t:
-        Penalize selecting items with high embedding similarity to already-selected items.
-        Compute as negative mean cosine similarity within current list.
+Steps:
+1. Implement `SequentialPolicy(state) -> logits`.
+2. Apply action masking for already-selected items before softmax.
+3. Provide both sampling mode (train) and greedy mode (eval).
+4. Keep architecture simple for first pass (single shared trunk + action head).
 
-Return reward vector per step:
-    r_t = [r_pref_t, r_health_t, r_div_t]
-
-Scalarized episodic return (for optimization):
-    R = ∑_t w · r_t  (where w is sampled weight vector).
+Important carry-over decision:
+- Prior objective-head/logit-composition trick is not baseline here.
+- Hold it as optional ablation only after implicit baseline is validated.
 
 Deliverable:
-    Environment returns multi-objective reward vector per step; scalarization happens in training loop.
+- `code/seqmorl/policy.py` with stable masked action selection.
 
 ---
 
-# PHASE 5: Conditional MORL Policy
+## Phase 4: Objective decomposition and trajectory collection
 
-Goal: Learn a trade-off-aware policy.
+Goal: compute objective-specific returns from shared trajectories.
 
-Approach:
-    Train conditional policy π(a | s, w)
+Steps:
+1. For each episode, collect per-step reward vector:
+   - preference channel,
+   - health channel,
+   - diversity channel.
+2. Compute objective-specific episode returns:
+   - `R_pref`, `R_health`, `R_div`.
+3. Build policy-gradient terms per objective from same log-prob trajectory.
 
-Where:
-    w = preference vector sampled from simplex
-    w ∈ ℝ^3, w_i ≥ 0, sum(w_i) = 1
+Reward semantics clarification:
+- Environment should emit full vector reward per step (`[r_pref, r_health, r_div]`).
+- Optimization combines objective information at gradient level via MGDA-style aggregation (not via inference-time preference vectors).
+- Validation/test must report objective metrics independently (not just a single scalar).
 
-Step 1: Extend state:
-    s'_t = concat(s_t, w)
-
-Step 2: During training:
-    - Sample weight vector w (Dirichlet distribution)
-    - Run K-step episode conditioned on w
-    - Compute scalar reward for optimization using:
-          R_t = w · r_t
-    - Apply standard policy gradient update
-      (REINFORCE with baseline is sufficient)
+Key distinction from old explicit approach:
+- No sampled Dirichlet weights.
+- No scalar `w dot r` episode return for primary optimization.
 
 Deliverable:
-    Single conditional policy capable of producing different trade-offs.
+- Objective-wise rollout buffers in `code/seqmorl/training.py`.
 
 ---
 
-# PHASE 6: Training Loop
+## Phase 5: MGDA-style gradient combination inside RL updates
 
-Goal: Stable episodic training across trade-offs.
+Goal: implicit multi-objective balancing at gradient level with comprehensive W&B instrumentation.
 
-Configuration:
-    - Batch size: 32–64 users per gradient step (adjust per GPU memory on A100s).
-    - Weight sampling: Dirichlet(α = [1,1,1]) for symmetric preference distribution.
+Steps:
+1. Construct three objective losses (policy-gradient style), one per objective.
+2. Compute per-objective gradients on shared parameters (retain graph as needed).
+3. Normalize gradients (start with L2 normalization).
+4. Use min-norm solver to obtain convex combination coefficients.
+5. Form combined update direction and apply optimizer step.
 
-Step 1: Sample batch of users (size B).
-Step 2: For each user:
-    - Sample weight vector w from Dirichlet simplex
-    - Run K-step episode with sampled w
-    - Collect trajectory {s_t, a_t, r_t} for t=0..K-1
-Step 3: Aggregate rewards:
-    R_episode = ∑_t w · r_t (scalar per episode)
-Step 4: Update policy via REINFORCE:
-    ∇ log π(a_t | s_t, w) * R_episode
+Training boundary:
+- No gradients flow into SGSL/GNN embedding parameters.
+- Only sequential policy (and optional sequential value/baseline heads) are trainable in this stage.
 
-No gradients flow into GNN.
-No retraining of embeddings.
+Reference pattern:
+- Mirror the aggregation workflow used in `code/RCSYS_utils.py` + `code/min_norm_solvers.py`, adapted for policy-gradient objectives.
 
-Checkpoint:
-    - policy parameters (network weights)
-    - training statistics (per-objective returns, policy loss trajectories)
+**W&B Logging (REQUIRED per epoch):**
+According to W&B Logging Patterns section, log to W&B with prefix `train/`:
+- `objective_grad_norm_pref`, `objective_grad_norm_health`, `objective_grad_norm_div` (norms BEFORE L2 normalization)
+- `mgda_coeff_pref`, `mgda_coeff_health`, `mgda_coeff_div` (solver output - PRIMARY collapse detector)
+- `cumulative_advantage_pref`, `cumulative_advantage_health`, `cumulative_advantage_div` (per-objective advantage)
+- `objective_dominance_ratio`: max(mgda_coeffs) / min(mgda_coeffs); if > 10 for 50+ epochs, pause training
+- `grad_norm` (combined norm after MGDA combination)
+- `mean_reward_pref`, `mean_reward_health`, `mean_reward_div` + std variants
+- Use `tracker.log({...}, step=epoch)` to send all metrics to W&B with step counter for proper alignment on dashboard
+
+**Mid-run diagnostics:**
+- Check W&B dashboard every 50 epochs using `wandb beta leet run <offline-run-path>` to visually confirm MGDA coefficients are not dominated (none should stay > 0.95)
+- If any coefficient dominates, stop and investigate before continuing training
+
+Required logs (local JSONL + W&B):
+- All metrics listed above, per epoch
+- Make metrics human-readable for json debugging
 
 Deliverable:
-    Trained conditional MORL policy π(a | s, w).
+- MGDA-style policy update in `code/seqmorl/training.py` with full W&B instrumentation per epoch.
 
 ---
 
-# PHASE 7: Trade-Off Selection via Validation Metrics
+## Phase 6: Variance control and guardrails
 
-Goal: Select final operating point empirically.
+Goal: prevent instability and objective collapse.
 
-Step 1: Define small grid of weight vectors W_eval.
-    - (10–20 evenly spaced preference vectors sampled from simplex).
-    - Include corner points (1,0,0), (0,1,0), (0,0,1) + uniform weights.
+Steps:
+1. Add objective-wise baselines (or moving averages) to form objective advantages.
+2. Apply gradient clipping.
+3. Add fail-fast diagnostics:
+   - objective dominance ratio,
+   - collapsed action diversity,
+   - near-zero useful learning signal.
+4. Implement robust rollout diagnostics for implicit training, incorporating only concepts validated in prior experiments.
 
-Step 2: For each w in W_eval:
-    - Generate Top-K lists on validation split (using π(· | s, w))
-    - Compute metrics:
-        - NDCG@K (preference quality)
-        - Health score (tag coverage alignment)
-        - Diversity score (mean pairwise dissimilarity in K-list)
+Guardrail examples:
+- if one objective coefficient stays near 1.0 for long windows, flag imbalance.
+- if action distributions collapse across users, flag mode collapse.
 
-Step 3: Select operating weight w* using one of:
-    - Option A: Maximize (α·NDCG + β·Health) subject to Diversity ≥ threshold
-    - Option B: Lexicographic: prioritize NDCG, then break ties on Health
-    - Option C: Extract Pareto front; select median point
-    (Decision: TBD after Phase 6 validation results; default Option A with α=0.7, β=0.3)
-
-Final step: Evaluate π(· | s, w*) on test split.
+**W&B Guardrail Visualization:**
+- Plot objective dominance ratio (max coefficient / min coefficient) on W&B; if > 10 for 50+ epochs, trigger alert.
+- Plot action entropy per objective on separate W&B lines; if any drops below 0.5 nats, flag as mode collapse risk.
+- Plot baseline variance per objective; use W&B annotations to mark high-variance phases.
+- Create W&B alerts/triggers for: single objective coefficient > 0.95, action entropy < 0.5 nats, any loss NaN or inf.
 
 Deliverable:
-    Selected weight vector w*; test-set evaluation metrics under w*.
+- Stable training loop with early warning logs, rich W&B instrumentation, and mid-run leet viewer inspection capability.
 
 ---
 
-# LOGGING AND DOCUMENTATION
+## Phase 7: Evaluation design (single-policy)
 
-**Agent Responsibility:** Maintain a running log of all implementation work in `auto_logs.md`.
+Goal: evaluate as a single deployed policy.
 
-Log after completing each phase and should include:
-- **Phase completion summary:** What was implemented, file paths created/modified.
-- **Key decisions made:** Any hyperparameter choices, design trade-offs, or ambiguities resolved.
-- **Git commits:** Reference any commits created during the phase.
-- **Blockers and resolutions:** Any issues encountered and how they were addressed.
-- **Code snippets:** Brief inline examples of critical functions/classes added.
-- **Next-phase notes:** Clarifications or assumptions that affect downstream phases.
+Steps:
+1. Define evaluation protocol with one policy inference path only (no weight-grid search and no deployment-time w* selection).
+2. Run one policy inference path on validation and test splits.
+3. Compute and log:
+   - ndcg, recall/precision,
+   - health score,
+   - diversity score,
+   - optional coverage metrics.
+4. Compare directly against one-shot SGSL baseline on same splits.
 
-Format: Use markdown with phase headers (e.g., `## Phase 1: Embedding Extraction`) and timestamp entries where relevant.
-
-This log enables rapid investigation of implementation decisions and serves as a traceback for debugging or adjustments.
-
----
-
-# CONTRIBUTION STATEMENT ALIGNMENT
-
-**SGSL + MGDA (Training):**
-- Multi-objective gradient balancing in embedding space during GNN training.
-- Balances preference, health, and diversity objectives at each epoch.
-- Produces a single set of compromised embeddings.
-
-**MORL (Inference):**
-- Takes frozen embeddings; constructs recommendations sequentially.
-- Learns a conditional policy π(a|s,w) that adapts to preference weights.
-- Performs horizon-aware allocation of objectives across K recommendation steps.
-- Defers trade-off decisions to inference time (validation metric selection).
-
-**Key difference:**
-- MGDA: myopic, parameter-space compromise during training.
-- MORL: foresighted, policy-space allocation during recommendation.
-
-Both use identical frozen embeddings. MORL does not replace MGDA training; it augments the inference mechanism to exploit learned representations more effectively via sequential decision-making.
+Deliverable:
+- `code/seqmorl/evaluation.py` + evaluation block in `seqmorl_main.py`.
 
 ---
 
-# END CONDITION
+## Phase 8: Optional ablations (only after baseline pass)
+
+Goal: improve performance only with isolated, gated changes.
+
+Ablation order:
+1. + stronger objective-wise baseline/value estimator.
+2. + optional objective-head architecture if objective disentanglement appears weak.
+3. + optional terminal shaping if metrics indicate step/final mismatch.
+
+Rules:
+- one change at a time,
+- fixed seeds and split parity,
+- keep or revert strictly by metric and stability gates.
+
+Deliverable:
+- Clear keep/revert decisions for each ablation.
+
+---
+
+## Phase 9: Output artifacts and handoff package
+
+Goal: make implementation reproducible and reviewable.
+
+Required outputs:
+- trained sequential policy checkpoints,
+- run config json,
+- train/eval metrics jsonl,
+- concise analysis summary markdown,
+- baseline vs sequential comparison table.
+
+Documentation:
+- update `README_SEQMORL.md` with architecture, equations, and run commands.
+- explicitly describe how implicit balancing differs from explicit weight-conditioned MORL.
+- include two canonical run commands: one for CPU laptop (`--device cpu`) and one for cluster/A100 (`--device cuda`), plus recommended `--device auto` default.
+
+---
+
+## Logging and implementation trace
+
+Maintain `auto_logs.md` at repository root after each phase.
+
+Each phase log entry must include:
+- files added/modified,
+- design decisions and rationale,
+- metric snapshots (from both local JSONL and W&B),
+- blockers and fixes,
+- next-phase prerequisites.
+
+**W&B Plotting and Monitoring (MANDATORY):**
+- Every training run MUST log to W&B in offline mode (`mode='offline'`).
+- Every phase involving training must include:
+  - W&B dashboard screenshots showing per-objective losses and MGDA coefficients.
+  - W&B leet viewer command (e.g., `python -m wandb beta leet run ...`) saved to auto_logs.md.
+  - Three-objective stacked area chart of MGDA coefficients (visual check for dominance).
+- Use `wandb beta leet run` during training to interactively monitor stability; do NOT wait until end of run.
+- If objective_dominance_ratio > 10 for 50+ consecutive epochs OR action_entropy < 0.05 OR probe_first_action_span ≈ 0:
+  - PAUSE training immediately.
+  - Document the exact epoch and metric value in auto_logs.md.
+  - Do NOT suppress the warning; investigate root cause before resuming.
+  - These are signals of prior MORL failure mode recurrence.
+
+---
+
+## Acceptance criteria
+
+The pivot is successful only if all are true:
+
+1. Inference does not require tradeoff vector input.
+2. Sequential policy is trained with implicit multi-objective balancing (MGDA-style gradient combination).
+3. Evaluation uses a single policy path with no weight-grid selection stage.
+4. Metrics are at least competitive with one-shot baseline and show stable objective behavior.
+5. Training logs show non-degenerate multi-objective optimization (no persistent single-objective collapse).
+6. **W&B instrumentation is complete**: all metrics from W&B Logging Patterns section are logged and visible in offline W&B dashboard. No warnings (objective dominance > 10x, action entropy < 0.05, probe_first_action_span ≈ 0) triggered during training.
+7. Device portability is verified: the same codepath runs successfully on CPU (`--device cpu`) and GPU (`--device cuda` when available), and `--device auto` resolves correctly.
+
+---
+
+## End condition
 
 System produces:
-    - SGSL-trained GNN with frozen embeddings (MGDA-balanced).
-    - Trained conditional MORL policy π(a | s, w).
-    - Validation-selected trade-off weight w*.
-    
-Evaluation compares:
-    - Baseline: one-shot Pareto ranking (main.py inference) on same embeddings.
-    - MORL: sequential list construction using trained policy w*.
-    - Metrics: NDCG, health score, diversity, coverage on test set.
+- original SGSL+MGDA training path unchanged,
+- frozen embedding checkpoint,
+- implicit sequential MORL package in `code/seqmorl`,
+- single-policy evaluation outputs,
+- reproducible implementation and ablation log trail.
 
-Proceed phase-by-phase.
-At the end of each phase, summarize implementation decisions and ambiguities before continuing.
+Proceed phase-by-phase and do not skip acceptance gates.

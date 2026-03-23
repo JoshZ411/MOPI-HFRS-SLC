@@ -1,14 +1,20 @@
 name: FRS
 channels:
+  - pyg
+  - pytorch
+  - nvidia
+  - conda-forge
   - defaults
 dependencies:
-  - python=3.8
-  - pytorch
+  - python=3.10
+  - pytorch=2.3.*
   - pytorch-cuda=12.1
   - torchaudio
   - torchvision
-  - dgl
-  - pytorch-sparse
   - ipykernel
   - pyg
-prefix: /home/zheyuanzhang/anaconda3/envs/FRS
+  - pytorch-sparse
+  - pip
+  - scikit-learn
+  - pip:
+      - wandb
