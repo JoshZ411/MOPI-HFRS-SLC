@@ -131,4 +131,3 @@ batch_size = number of users sampled for each training step
 - This means that a small test set in weights aren't actually yielding diff reccomendations 
 - 3/18/2026 logging indicates that the model isn't actually leveraging weights proberly since making a change to the weight leads to an irrelevant change`
 
-
