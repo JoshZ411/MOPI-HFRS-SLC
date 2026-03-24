@@ -40,6 +40,13 @@ MIN_ENTROPY_THRESHOLD = 0.05  # action entropy below this → mode collapse risk
 DOMINANCE_HIGH_EPOCHS = 50  # consecutive epochs above threshold before alert
 
 
+def _chunk_users(user_ids: list[int], chunk_size: int) -> list[list[int]]:
+    """Split user IDs into contiguous chunks."""
+    if chunk_size <= 0:
+        return [user_ids]
+    return [user_ids[i:i + chunk_size] for i in range(0, len(user_ids), chunk_size)]
+
+
 # ---------------------------------------------------------------------------
 # Rollout collection
 # ---------------------------------------------------------------------------
@@ -196,6 +203,8 @@ def mgda_policy_update(policy: SequentialPolicy,
         'policy_loss': float(combined_loss.item()),
         'grad_norm': float(combined_norm),
         'objective_dominance_ratio': dominance_ratio,
+        'num_steps': int(log_probs.numel()),
+        'num_users': int(len(rollout.get('first_actions', []))),
     }
     for obj in OBJECTIVES:
         stats[f'mgda_coeff_{obj}'] = sol[obj]
@@ -246,17 +255,78 @@ def train_implicit_morl(policy: SequentialPolicy,
     metrics_path = os.path.join(output_dir, 'train_metrics.jsonl')
     best_policy_path = os.path.join(output_dir, 'policy_best.pt')
     best_mean_reward = -float('inf')
+    train_batch_users = int(getattr(args, 'train_batch_users', 0))
+    if train_batch_users <= 0:
+        train_batch_users = len(train_user_ids)
 
     for epoch in range(args.epochs):
         policy.train()
-        print(f"[seqmorl][epoch {epoch}] collecting rollouts for {len(train_user_ids)} users ...")
-        rollout = collect_rollouts(policy, env, train_user_ids, args.gamma)
-        if rollout is None:
-            print(f"[Epoch {epoch}] No rollout data — skipping.")
+        # Shuffle per epoch and train in user mini-batches to bound graph size.
+        shuffled = train_user_ids[:]
+        if len(shuffled) > 1:
+            perm = torch.randperm(len(shuffled)).tolist()
+            shuffled = [shuffled[i] for i in perm]
+        user_chunks = _chunk_users(shuffled, train_batch_users)
+
+        print(
+            f"[seqmorl][epoch {epoch}] collecting rollouts for {len(train_user_ids)} users "
+            f"in {len(user_chunks)} chunks (chunk_size={train_batch_users}) ..."
+        )
+
+        weight_sum = 0.0
+        weighted: dict[str, float] = {}
+        all_actions_epoch: list[int] = []
+        first_actions_epoch: list[int] = []
+        entropy_sum = 0.0
+        total_steps = 0
+
+        for chunk_idx, chunk_users in enumerate(user_chunks):
+            rollout = collect_rollouts(policy, env, chunk_users, args.gamma)
+            if rollout is None:
+                continue
+
+            stats_chunk = mgda_policy_update(
+                policy,
+                optimizer,
+                rollout,
+                baselines,
+                grad_clip=args.grad_clip,
+            )
+
+            step_weight = float(max(1, stats_chunk.get('num_steps', 1)))
+            weight_sum += step_weight
+            for key, value in stats_chunk.items():
+                if key in {'num_steps', 'num_users'}:
+                    continue
+                weighted[key] = weighted.get(key, 0.0) + float(value) * step_weight
+
+            all_actions_epoch.extend(rollout['actions'])
+            first_actions_epoch.extend(rollout['first_actions'])
+            entropy_sum += float(rollout['entropies'].sum().item())
+            total_steps += int(rollout['entropies'].numel())
+
+            if len(user_chunks) > 1 and (
+                chunk_idx == 0
+                or chunk_idx == len(user_chunks) - 1
+                or chunk_idx % 10 == 0
+            ):
+                print(
+                    f"[seqmorl][epoch {epoch}] chunk {chunk_idx + 1}/{len(user_chunks)} "
+                    f"steps={stats_chunk['num_steps']} loss={stats_chunk['policy_loss']:.4f}"
+                )
+
+        if weight_sum == 0.0:
+            print(f"[Epoch {epoch}] No rollout data across chunks — skipping.")
             continue
 
-        stats = mgda_policy_update(policy, optimizer, rollout, baselines,
-                                   grad_clip=args.grad_clip)
+        stats = {k: (v / weight_sum) for k, v in weighted.items()}
+        stats['mean_entropy'] = (entropy_sum / max(1, total_steps))
+        stats['mean_action_position'] = (
+            float(sum(all_actions_epoch) / len(all_actions_epoch))
+            if all_actions_epoch else 0.0
+        )
+        stats['num_steps'] = int(total_steps)
+        stats['num_users'] = int(len(first_actions_epoch))
 
         # Update baselines via EMA.
         for obj in OBJECTIVES:
@@ -270,22 +340,14 @@ def train_implicit_morl(policy: SequentialPolicy,
             cumulative_adv[obj] += stats[f'mean_reward_{obj}'] - baselines[obj]
             stats[f'cumulative_advantage_{obj}'] = cumulative_adv[obj]
 
-        # Entropy and action position diagnostics.
-        entropies = rollout['entropies']
-        stats['mean_entropy'] = float(entropies.mean().item())
-        stats['mean_action_position'] = (
-            float(sum(rollout['actions']) / len(rollout['actions']))
-            if rollout['actions'] else 0.0
-        )
-
         # Probing diagnostics every 25 epochs.
-        if epoch % 25 == 0 and rollout['first_actions']:
-            first = rollout['first_actions']
+        if epoch % 25 == 0 and first_actions_epoch:
+            first = first_actions_epoch
             stats['probe_first_action_span'] = max(first) - min(first)
             # Pairwise Jaccard on top-K item sets not available without full
             # rollout replay; approximate with action-list diversity.
-            unique_actions = len(set(rollout['actions']))
-            total_actions = len(rollout['actions'])
+            unique_actions = len(set(all_actions_epoch))
+            total_actions = len(all_actions_epoch)
             stats['probe_pairwise_jaccard'] = (
                 unique_actions / total_actions if total_actions else 0.0
             )

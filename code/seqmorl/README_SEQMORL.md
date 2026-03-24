@@ -153,6 +153,7 @@ cd code
 python seqmorl/seqmorl_main.py \
     --device cuda \
     --epochs 500 \
+    --train_batch_users 256 \
     --M 200 \
     --K 20 \
     --lr 1e-3 \
@@ -167,8 +168,17 @@ cd code
 python seqmorl/seqmorl_main.py \
     --device auto \
     --epochs 500 \
+    --train_batch_users 256 \
     --use_wandb \
     --output_dir seqmorl_output
+
+### Throughput tuning
+
+- `--train_batch_users` controls how many users are processed per chunk inside
+    each epoch.
+- Lower values reduce peak graph/memory pressure and often improve wall-clock
+    throughput on long runs (especially when full train users are enabled).
+- Start with `256` on GPU and adjust to `128/512` based on observed epoch time.
 ```
 
 ### Prerequisites
