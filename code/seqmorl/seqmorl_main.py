@@ -173,6 +173,8 @@ def main():
                         help='Optional cap on number of val users used during training diagnostics (0 = all).')
     parser.add_argument('--train_batch_users', type=int, default=256,
                         help='Number of users per training chunk inside each epoch (0 = all users at once).')
+    parser.add_argument('--users_per_epoch', type=int, default=0,
+                        help='Optional number of randomly shuffled train users used per epoch (0 = all train users).')
     args = parser.parse_args()
 
     # --- Device setup ---

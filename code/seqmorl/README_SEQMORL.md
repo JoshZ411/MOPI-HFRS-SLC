@@ -176,9 +176,12 @@ python seqmorl/seqmorl_main.py \
 
 - `--train_batch_users` controls how many users are processed per chunk inside
     each epoch.
+- `--users_per_epoch` optionally subsamples shuffled train users each epoch;
+    this is often the most effective way to improve wall-clock progress.
 - Lower values reduce peak graph/memory pressure and often improve wall-clock
     throughput on long runs (especially when full train users are enabled).
-- Start with `256` on GPU and adjust to `128/512` based on observed epoch time.
+- Start with `--train_batch_users 256 --users_per_epoch 2048` on GPU, then
+    adjust toward `1024/4096` as hardware allows.
 ```
 
 ### Prerequisites

@@ -88,7 +88,8 @@ def collect_rollouts(policy: SequentialPolicy,
 
             log_probs_buf.append(log_prob)
             rewards_buf.append(reward)
-            entropies_buf.append(entropy)
+            # Entropy is only for diagnostics; detach to avoid graph growth.
+            entropies_buf.append(entropy.detach())
             actions_buf.append(action)
 
             state = next_state
@@ -167,7 +168,8 @@ def mgda_policy_update(policy: SequentialPolicy,
         grads[obj] = []
 
         optimizer.zero_grad()
-        loss.backward(retain_graph=True)
+        retain = i < (len(OBJECTIVES) - 1)
+        loss.backward(retain_graph=retain)
         raw_norm = 0.0
         for param in policy.parameters():
             if param.grad is not None:
@@ -188,19 +190,31 @@ def mgda_policy_update(policy: SequentialPolicy,
     )
     sol = {obj: float(sol_array[i]) for i, obj in enumerate(OBJECTIVES)}
 
-    # Form combined loss and apply update.
+    # Form combined gradient direction directly from stored objective grads.
+    # This is equivalent to backward() on the weighted loss but avoids an extra pass.
     optimizer.zero_grad()
-    combined_loss = sum(sol[obj] * loss_data[obj] for obj in OBJECTIVES)
-    combined_loss.backward()
+    params = [p for p in policy.parameters() if p.requires_grad]
+    for pi, param in enumerate(params):
+        combined_grad = None
+        for obj in OBJECTIVES:
+            if pi >= len(grads[obj]):
+                continue
+            g = float(sol[obj]) * grads[obj][pi]
+            combined_grad = g if combined_grad is None else (combined_grad + g)
+        if combined_grad is not None:
+            param.grad = combined_grad
+
     combined_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), grad_clip)
     optimizer.step()
+
+    combined_loss = sum(float(sol[obj]) * float(loss_data[obj].item()) for obj in OBJECTIVES)
 
     # Objective dominance ratio: max coeff / (min coeff + eps).
     coeffs = [sol[obj] for obj in OBJECTIVES]
     dominance_ratio = max(coeffs) / (min(coeffs) + 1e-8)
 
     stats = {
-        'policy_loss': float(combined_loss.item()),
+        'policy_loss': float(combined_loss),
         'grad_norm': float(combined_norm),
         'objective_dominance_ratio': dominance_ratio,
         'num_steps': int(log_probs.numel()),
@@ -258,6 +272,9 @@ def train_implicit_morl(policy: SequentialPolicy,
     train_batch_users = int(getattr(args, 'train_batch_users', 0))
     if train_batch_users <= 0:
         train_batch_users = len(train_user_ids)
+    users_per_epoch = int(getattr(args, 'users_per_epoch', 0))
+    if users_per_epoch <= 0:
+        users_per_epoch = len(train_user_ids)
 
     for epoch in range(args.epochs):
         policy.train()
@@ -266,10 +283,11 @@ def train_implicit_morl(policy: SequentialPolicy,
         if len(shuffled) > 1:
             perm = torch.randperm(len(shuffled)).tolist()
             shuffled = [shuffled[i] for i in perm]
-        user_chunks = _chunk_users(shuffled, train_batch_users)
+        epoch_users = shuffled[:users_per_epoch]
+        user_chunks = _chunk_users(epoch_users, train_batch_users)
 
         print(
-            f"[seqmorl][epoch {epoch}] collecting rollouts for {len(train_user_ids)} users "
+            f"[seqmorl][epoch {epoch}] collecting rollouts for {len(epoch_users)} users "
             f"in {len(user_chunks)} chunks (chunk_size={train_batch_users}) ..."
         )
 
