@@ -10,7 +10,6 @@ balancing is handled entirely at training time via MGDA gradient combination.
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.distributions import Categorical
 
 
@@ -36,6 +35,15 @@ class SequentialPolicy(nn.Module):
             nn.Linear(hidden_dim, action_dim),
         )
 
+    @classmethod
+    def build(cls,
+              state_dim: int,
+              action_dim: int,
+              hidden_dim: int = 256):
+        """Factory retained for compatibility with existing call-sites."""
+        model = cls(state_dim=state_dim, action_dim=action_dim, hidden_dim=hidden_dim)
+        return model
+
     def forward(self, state: torch.Tensor,
                 action_mask: torch.Tensor | None = None) -> torch.Tensor:
         """Return logits over actions.
@@ -48,6 +56,7 @@ class SequentialPolicy(nn.Module):
             logits: Tensor matching the action dimension.
         """
         logits = self.net(state)
+
         if action_mask is not None:
             logits = logits.masked_fill(action_mask, float('-inf'))
         return logits

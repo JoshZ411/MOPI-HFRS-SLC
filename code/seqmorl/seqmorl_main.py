@@ -161,6 +161,16 @@ def main():
                         help='Gradient clipping norm.')
     parser.add_argument('--log_interval', type=int, default=50,
                         help='Epochs between console log lines.')
+    parser.add_argument('--val_eval_interval', type=int, default=5,
+                        help='Epoch interval for validation ranking evaluation during training (0 disables).')
+    parser.add_argument('--early_stop_on_val_ndcg', type=int, default=1, choices=[0, 1],
+                        help='Enable early stopping when val_ndcg plateaus (1=enabled, 0=disabled).')
+    parser.add_argument('--val_ndcg_patience', type=int, default=4,
+                        help='Number of consecutive val evaluations without improvement before stopping (0 disables).')
+    parser.add_argument('--val_ndcg_min_delta', type=float, default=1e-4,
+                        help='Minimum val_ndcg improvement required to reset patience.')
+    parser.add_argument('--val_ndcg_warmup_epochs', type=int, default=8,
+                        help='Number of initial epochs before val_ndcg early-stop checks are allowed.')
     parser.add_argument('--output_dir', type=str, default='seqmorl_output',
                         help='Directory for checkpoints and metrics.')
     parser.add_argument('--use_wandb', action='store_true',
@@ -175,6 +185,8 @@ def main():
                         help='Number of users per training chunk inside each epoch (0 = all users at once).')
     parser.add_argument('--users_per_epoch', type=int, default=0,
                         help='Optional number of randomly shuffled train users used per epoch (0 = all train users).')
+    parser.add_argument('--exclude_seen_candidates', type=int, default=1, choices=[0, 1],
+                        help='Exclude seen train interactions when building candidate pools (1=enabled, 0=disabled).')
     args = parser.parse_args()
 
     # --- Device setup ---
@@ -199,9 +211,9 @@ def main():
     edge_label_index = graph[('user', 'eats', 'food')].edge_label_index
 
     (train_edge_index, val_edge_index, test_edge_index,
-     pos_train_edge_index, neg_train_edge_index,
-     pos_val_edge_index, neg_val_edge_index,
-     pos_test_edge_index, neg_test_edge_index) = split_data_new(
+     _pos_train_edge_index, _neg_train_edge_index,
+     pos_val_edge_index, _neg_val_edge_index,
+     pos_test_edge_index, _neg_test_edge_index) = split_data_new(
         edge_index, edge_label_index
     )
 
@@ -228,11 +240,12 @@ def main():
         M=args.M,
         K=args.K,
         device=str(device),
+        exclude_edge_indices=[train_edge_index] if args.exclude_seen_candidates == 1 else None,
     )
     print(f"[seqmorl] State dim={env.state_dim}, Action dim={env.action_dim}")
 
     # --- Build policy ---
-    policy = SequentialPolicy(
+    policy = SequentialPolicy.build(
         state_dim=env.state_dim,
         action_dim=env.action_dim,
         hidden_dim=args.hidden_dim,
@@ -249,11 +262,12 @@ def main():
 
     # --- One-shot baseline (val) ---
     print("[seqmorl] Computing one-shot baseline on val split …")
+    val_exclusions = [train_edge_index]
     baseline_val = _oneshot_metrics(
         user_emb.cpu(), item_emb.cpu(),
         user_tags, food_tags,
         pos_val_edge_index,
-        [neg_train_edge_index],
+        val_exclusions,
         val_users, args.K, torch.device('cpu'),
     )
     print("[seqmorl] One-shot val metrics:", baseline_val)
@@ -271,6 +285,13 @@ def main():
         args=args,
         tracker=tracker,
         output_dir=args.output_dir,
+        val_eval_context={
+            'pos_edge_index': pos_val_edge_index,
+            'user_tags': user_tags,
+            'food_tags': food_tags,
+            'K': args.K,
+            'exclude_edge_indices': val_exclusions,
+        },
     )
 
     # --- Sequential evaluation (val) ---
@@ -283,18 +304,19 @@ def main():
         user_tags=user_tags,
         food_tags=food_tags,
         K=args.K,
-        exclude_edge_indices=[neg_train_edge_index],
+        exclude_edge_indices=val_exclusions,
     )
 
     compare_baselines(baseline_val, seq_val, split='val')
 
     # --- One-shot baseline (test) ---
     print("[seqmorl] Computing one-shot baseline on test split …")
+    test_exclusions = [train_edge_index, val_edge_index]
     baseline_test = _oneshot_metrics(
         user_emb.cpu(), item_emb.cpu(),
         user_tags, food_tags,
         pos_test_edge_index,
-        [neg_train_edge_index],
+        test_exclusions,
         [int(u) for u in test_users], args.K, torch.device('cpu'),
     )
 
@@ -309,7 +331,7 @@ def main():
         user_tags=user_tags,
         food_tags=food_tags,
         K=args.K,
-        exclude_edge_indices=[neg_train_edge_index],
+        exclude_edge_indices=test_exclusions,
     )
 
     compare_baselines(baseline_test, seq_test, split='test')

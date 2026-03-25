@@ -34,7 +34,8 @@ class SequentialRecEnv:
     """
 
     def __init__(self, user_emb, item_emb, food_tags, user_tags,
-                 M: int = 200, K: int = 20, device: str = 'cpu'):
+                 M: int = 200, K: int = 20, device: str = 'cpu',
+                 exclude_edge_indices: list[torch.Tensor] | None = None):
         self.device = torch.device(device)
         self.user_emb = user_emb.to(self.device)
         self.item_emb = item_emb.to(self.device)
@@ -48,6 +49,9 @@ class SequentialRecEnv:
         self.num_items = item_emb.size(0)
         self.dim = user_emb.size(1)
         self.num_tags = food_tags.size(1)
+
+        self.exclude_edge_indices = exclude_edge_indices or []
+        self.excluded_items_by_user = self._build_excluded_items_by_user()
 
         # Precompute top-M candidate pools once (no dynamic reranking).
         self._precompute_candidate_pools()
@@ -65,11 +69,34 @@ class SequentialRecEnv:
     # Candidate pool
     # ------------------------------------------------------------------
 
+    def _build_excluded_items_by_user(self) -> dict[int, set[int]]:
+        """Build per-user exclusion sets from edge-index tensors."""
+        excluded: dict[int, set[int]] = {}
+        for edge_index in self.exclude_edge_indices:
+            if edge_index is None or edge_index.numel() == 0:
+                continue
+            for u, i in edge_index.T.tolist():
+                uid = int(u)
+                iid = int(i)
+                if uid not in excluded:
+                    excluded[uid] = set()
+                excluded[uid].add(iid)
+        return excluded
+
     def _precompute_candidate_pools(self):
-        """Compute top-M items per user via dot-product score."""
+        """Compute top-M items per user via dot-product score with exclusions."""
         with torch.no_grad():
             scores = torch.matmul(self.user_emb, self.item_emb.T)  # [num_users, num_items]
-            _, self.candidate_pools = torch.topk(scores, k=self.M, dim=1)
+            for uid, excluded_items in self.excluded_items_by_user.items():
+                if not excluded_items:
+                    continue
+                excluded_idx = torch.tensor(
+                    sorted(excluded_items), dtype=torch.long, device=self.device
+                )
+                scores[uid, excluded_idx] = float('-inf')
+
+            top_scores, self.candidate_pools = torch.topk(scores, k=self.M, dim=1)
+            self.candidate_valid_mask = torch.isfinite(top_scores)
             # candidate_pools: [num_users, M]
 
     # ------------------------------------------------------------------
@@ -81,7 +108,7 @@ class SequentialRecEnv:
         self.current_user = user_id
         self.step_count = 0
         self._num_selected = 0
-        self.selected_mask = torch.zeros(self.M, dtype=torch.bool, device=self.device)
+        self.selected_mask = (~self.candidate_valid_mask[user_id]).clone()
         self.item_agg_emb = torch.zeros(self.dim, device=self.device)
         self.tag_coverage = torch.zeros(self.num_tags, device=self.device)
         return self._get_state()

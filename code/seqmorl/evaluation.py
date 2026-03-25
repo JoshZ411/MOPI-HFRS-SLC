@@ -29,7 +29,8 @@ from seqmorl.policy import SequentialPolicy
 
 def _greedy_rollout(policy: SequentialPolicy,
                     env: SequentialRecEnv,
-                    user_ids: list[int]) -> dict[int, list[int]]:
+                    user_ids: list[int],
+                    excluded_items_by_user: dict[int, set[int]] | None = None) -> dict[int, list[int]]:
     """Return per-user recommended item lists (greedy policy)."""
     policy.eval()
     recommendations: dict[int, list[int]] = {}
@@ -38,8 +39,24 @@ def _greedy_rollout(policy: SequentialPolicy,
             state = env.reset(uid)
             items: list[int] = []
             done = False
+            excluded_items = set()
+            if excluded_items_by_user is not None:
+                excluded_items = excluded_items_by_user.get(uid, set())
+
+            excluded_action_mask = torch.zeros(env.action_dim, dtype=torch.bool, device=env.device)
+            if excluded_items:
+                candidate_items = env.candidate_pools[uid]
+                excluded_tensor = torch.tensor(
+                    sorted(excluded_items), dtype=torch.long, device=env.device
+                )
+                excluded_action_mask = torch.isin(candidate_items, excluded_tensor)
+
             while not done:
                 mask = env.get_action_mask()
+                if excluded_items:
+                    mask = mask | excluded_action_mask
+                if bool(mask.all()):
+                    break
                 action, _, _ = policy.select_action(state, mask, greedy=True)
                 next_state, _, done, item_idx = env.step(action)
                 items.append(item_idx)
@@ -127,14 +144,25 @@ def evaluate_sequential(policy: SequentialPolicy,
     for u, i in pos_edge_index.T.tolist():
         gt[int(u)].add(int(i))
 
+    excluded_items_by_user: dict[int, set[int]] = defaultdict(set)
+    if exclude_edge_indices is not None:
+        for edge_index in exclude_edge_indices:
+            if edge_index is None or edge_index.numel() == 0:
+                continue
+            for u, i in edge_index.T.tolist():
+                excluded_items_by_user[int(u)].add(int(i))
+
     # Greedy rollout.
-    recs = _greedy_rollout(policy, env, user_ids)
+    recs = _greedy_rollout(policy, env, user_ids, excluded_items_by_user)
 
     ndcg_vals, rec_vals, prec_vals, health_vals, div_vals = [], [], [], [], []
     all_recommended: set[int] = set()
 
     for uid in user_ids:
         recommended = recs.get(uid, [])
+        if uid in excluded_items_by_user:
+            excluded = excluded_items_by_user[uid]
+            recommended = [i for i in recommended if i not in excluded]
         ground_truth = gt.get(uid, set())
         if not ground_truth:
             continue

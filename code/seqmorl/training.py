@@ -16,10 +16,8 @@ References:
 
 import os
 import sys
-import json
 import math
 import torch
-import torch.nn.functional as F
 
 # Allow importing from the parent code/ directory when run as a script.
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -30,6 +28,7 @@ if _CODE not in sys.path:
 from min_norm_solvers import MinNormSolver, gradient_normalizers
 from seqmorl.environment import SequentialRecEnv
 from seqmorl.policy import SequentialPolicy
+from seqmorl.evaluation import evaluate_sequential
 from seqmorl.logging_utils import WandbTracker, save_jsonl, save_json
 
 OBJECTIVES = ['pref', 'health', 'div']
@@ -54,8 +53,7 @@ def _chunk_users(user_ids: list[int], chunk_size: int) -> list[list[int]]:
 def collect_rollouts(policy: SequentialPolicy,
                      env: SequentialRecEnv,
                      user_ids: list[int],
-                     gamma: float = 0.99,
-                     device: torch.device | None = None):
+                     gamma: float = 0.99):
     """Run one episode per user and return trajectory data.
 
     Returns:
@@ -83,6 +81,8 @@ def collect_rollouts(policy: SequentialPolicy,
 
         while not done:
             mask = env.get_action_mask()
+            if bool(mask.all()):
+                break
             action, log_prob, entropy = policy.select_action(state, mask, greedy=False)
             next_state, reward, done, _ = env.step(action)
 
@@ -239,7 +239,8 @@ def train_implicit_morl(policy: SequentialPolicy,
                         val_user_ids: list[int],
                         args,
                         tracker: WandbTracker,
-                        output_dir: str) -> SequentialPolicy:
+                        output_dir: str,
+                        val_eval_context: dict | None = None) -> SequentialPolicy:
     """Implicit multi-objective sequential MORL training.
 
     Args:
@@ -267,15 +268,22 @@ def train_implicit_morl(policy: SequentialPolicy,
     dominance_high_count = 0
 
     metrics_path = os.path.join(output_dir, 'train_metrics.jsonl')
-    best_policy_path = os.path.join(output_dir, 'policy_best.pt')
+    best_ndcg_policy_path = os.path.join(output_dir, 'policy_best.pt')
+    best_reward_policy_path = os.path.join(output_dir, 'policy_best_reward.pt')
     best_mean_reward = -float('inf')
+    best_val_ndcg = -float('inf')
+    no_improve_evals = 0
     train_batch_users = int(getattr(args, 'train_batch_users', 0))
     if train_batch_users <= 0:
         train_batch_users = len(train_user_ids)
     users_per_epoch = int(getattr(args, 'users_per_epoch', 0))
     if users_per_epoch <= 0:
         users_per_epoch = len(train_user_ids)
-
+    val_eval_interval = int(getattr(args, 'val_eval_interval', 5))
+    val_ndcg_patience = int(getattr(args, 'val_ndcg_patience', 0))
+    val_ndcg_min_delta = float(getattr(args, 'val_ndcg_min_delta', 0.0))
+    early_stop_on_val_ndcg = int(getattr(args, 'early_stop_on_val_ndcg', 1)) == 1
+    val_ndcg_warmup_epochs = int(getattr(args, 'val_ndcg_warmup_epochs', 0))
     for epoch in range(args.epochs):
         policy.train()
         # Shuffle per epoch and train in user mini-batches to bound graph size.
@@ -299,7 +307,12 @@ def train_implicit_morl(policy: SequentialPolicy,
         total_steps = 0
 
         for chunk_idx, chunk_users in enumerate(user_chunks):
-            rollout = collect_rollouts(policy, env, chunk_users, args.gamma)
+            rollout = collect_rollouts(
+                policy,
+                env,
+                chunk_users,
+                args.gamma,
+            )
             if rollout is None:
                 continue
 
@@ -345,6 +358,9 @@ def train_implicit_morl(policy: SequentialPolicy,
         )
         stats['num_steps'] = int(total_steps)
         stats['num_users'] = int(len(first_actions_epoch))
+
+        coeffs_epoch = [stats[f'mgda_coeff_{o}'] for o in OBJECTIVES]
+        stats['objective_dominance_ratio'] = max(coeffs_epoch) / (min(coeffs_epoch) + 1e-8)
 
         # Update baselines via EMA.
         for obj in OBJECTIVES:
@@ -396,11 +412,56 @@ def train_implicit_morl(policy: SequentialPolicy,
                 "— prior MORL failure symptom (all users choosing same first action)."
             )
 
-        # Save checkpoint if mean preference reward improved.
+        # Save checkpoint if mean reward improved.
         mean_r = sum(stats[f'mean_reward_{o}'] for o in OBJECTIVES) / 3
         if mean_r > best_mean_reward:
             best_mean_reward = mean_r
-            torch.save(policy.state_dict(), best_policy_path)
+            torch.save(policy.state_dict(), best_reward_policy_path)
+
+        # Periodic validation for ranking-aligned model selection.
+        run_val_eval = (
+            val_eval_context is not None
+            and val_eval_interval > 0
+            and (epoch % val_eval_interval == 0 or epoch == args.epochs - 1)
+        )
+        should_stop_early = False
+        if run_val_eval:
+            assert val_eval_context is not None
+            eval_ctx = val_eval_context
+            val_metrics = evaluate_sequential(
+                policy=policy,
+                env=env,
+                user_ids=val_user_ids,
+                pos_edge_index=eval_ctx['pos_edge_index'],
+                user_tags=eval_ctx['user_tags'],
+                food_tags=eval_ctx['food_tags'],
+                K=int(eval_ctx['K']),
+                exclude_edge_indices=eval_ctx.get('exclude_edge_indices'),
+            )
+            val_ndcg = float(val_metrics.get('ndcg', 0.0))
+            stats['val_ndcg'] = val_ndcg
+            stats['val_recall'] = float(val_metrics.get('recall', 0.0))
+            stats['val_precision'] = float(val_metrics.get('precision', 0.0))
+
+            if val_ndcg > (best_val_ndcg + val_ndcg_min_delta):
+                best_val_ndcg = val_ndcg
+                if epoch >= val_ndcg_warmup_epochs:
+                    no_improve_evals = 0
+                torch.save(policy.state_dict(), best_ndcg_policy_path)
+            elif epoch >= val_ndcg_warmup_epochs:
+                no_improve_evals += 1
+
+            if (
+                early_stop_on_val_ndcg
+                and val_ndcg_patience > 0
+                and epoch >= val_ndcg_warmup_epochs
+                and no_improve_evals >= val_ndcg_patience
+            ):
+                should_stop_early = True
+                print(
+                    f"[EARLY STOP] Epoch {epoch}: val_ndcg did not improve by > {val_ndcg_min_delta:.6f} "
+                    f"for {no_improve_evals} evaluation checkpoints (patience={val_ndcg_patience})."
+                )
 
         # Logging.
         epoch_log = {'epoch': epoch, **stats}
@@ -416,12 +477,33 @@ def train_implicit_morl(policy: SequentialPolicy,
                 f"dom={dom:.2f} | ent={stats['mean_entropy']:.3f} | "
                 f"coeffs=[{coeff_str}]"
             )
+            if 'val_ndcg' in stats:
+                print(
+                    f"[seqmorl][epoch {epoch}] val_ndcg={stats['val_ndcg']:.5f} "
+                    f"val_recall={stats['val_recall']:.5f} "
+                    f"val_precision={stats['val_precision']:.5f}"
+                )
+
+        if should_stop_early:
+            break
 
     # Save final policy.
     final_path = os.path.join(output_dir, 'policy_final.pt')
     torch.save(policy.state_dict(), final_path)
     print(f"Training complete. Final policy saved to {final_path}")
-    print(f"Best policy saved to {best_policy_path}")
+    print(f"Best reward policy saved to {best_reward_policy_path}")
+
+    if os.path.exists(best_ndcg_policy_path):
+        policy.load_state_dict(torch.load(best_ndcg_policy_path, map_location=env.device))
+        print(
+            f"Best ranking policy saved to {best_ndcg_policy_path} "
+            f"(best val_ndcg={best_val_ndcg:.5f})"
+        )
+    else:
+        torch.save(policy.state_dict(), best_ndcg_policy_path)
+        print(
+            f"No val-eval checkpoint created; wrote fallback best policy to {best_ndcg_policy_path}"
+        )
 
     # Save leet command.
     leet_cmd = tracker.leet_command()
