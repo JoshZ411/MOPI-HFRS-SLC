@@ -23,6 +23,32 @@ from seqmorl.environment import SequentialRecEnv
 from seqmorl.policy import SequentialPolicy
 
 
+def compute_car(recall: float, diversity: float, diversity_weight: float = 0.3) -> float:
+    """Consistency-adjusted recall (CAR): recall with a diversity bonus."""
+    return float(recall * (1.0 + diversity_weight * max(0.0, diversity)))
+
+
+def compute_svs(baseline_metrics: dict,
+                sequential_metrics: dict,
+                health_weight: float = 0.5,
+                diversity_weight: float = 0.3) -> dict:
+    """Sequential Value Score (SVS) and its weighted components."""
+    delta_ndcg = float(sequential_metrics.get('ndcg', 0.0) - baseline_metrics.get('ndcg', 0.0))
+    delta_health = float(sequential_metrics.get('health', 0.0) - baseline_metrics.get('health', 0.0))
+    delta_diversity = float(
+        sequential_metrics.get('diversity', 0.0) - baseline_metrics.get('diversity', 0.0)
+    )
+    svs = delta_ndcg + (health_weight * delta_health) + (diversity_weight * delta_diversity)
+    return {
+        'svs': float(svs),
+        'delta_ndcg': delta_ndcg,
+        'delta_health': delta_health,
+        'delta_diversity': delta_diversity,
+        'health_weight': float(health_weight),
+        'diversity_weight': float(diversity_weight),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Greedy policy rollout
 # ---------------------------------------------------------------------------
@@ -185,6 +211,10 @@ def evaluate_sequential(policy: SequentialPolicy,
         'health': float(np.mean(health_vals)) if health_vals else 0.0,
         'diversity': float(np.mean(div_vals)) if div_vals else 0.0,
         'coverage': coverage,
+        'car': compute_car(
+            float(np.mean(rec_vals)) if rec_vals else 0.0,
+            float(np.mean(div_vals)) if div_vals else 0.0,
+        ),
     }
 
 
@@ -198,6 +228,8 @@ def compare_baselines(baseline_metrics: dict,
     print(f"{'Metric':<22}{'One-shot Baseline':>18}{'Sequential MORL':>18}")
     print(f"{'-'*60}")
     keys = ['ndcg', 'recall', 'precision', 'health', 'diversity', 'coverage']
+    if 'car' in baseline_metrics or 'car' in sequential_metrics:
+        keys.append('car')
     for k in keys:
         b = baseline_metrics.get(k, float('nan'))
         s = sequential_metrics.get(k, float('nan'))
