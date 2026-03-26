@@ -1,0 +1,33 @@
+name: FRS
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.10
+  - pytorch=2.3.*
+  - torchvision
+  - torchaudio
+  - ipykernel
+  - pandas
+  - scikit-learn
+  - pip
+  - pip:
+      - transformers==4.49.0
+      - wandb
+      - --find-links https://data.pyg.org/whl/torch-2.3.1+cpu.html
+      - pyg-lib
+      - torch-scatter
+      - torch-sparse
+      - torch-cluster
+      - torch-spline-conv
+
+# This yml file is how I built the CPU-exclusive environment to run MOPI-HFRS on my laptop
+# with an outdated GPU.
+
+# conda env remove -n FRS -y
+# conda env create -f environment.local.yml
+# conda env update -f environment.local.yml --prune
+# conda activate FRS

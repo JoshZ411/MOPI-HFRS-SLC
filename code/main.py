@@ -171,6 +171,20 @@ def main():
                 'test_percentage_recommended_foods': round(percentage_recommended_foods, 5)
             })
 
+        # Save frozen embeddings for downstream sequential MORL stage.
+        # The SGSL training loop is intentionally left unchanged above.
+        users_emb_full, _, items_emb_full, _ = model.forward(
+            feature_dict, test_edge_index, pos_test_edge_index, neg_test_edge_index)
+        torch.save(
+            {
+                'user_emb': users_emb_full.detach().cpu(),
+                'item_emb': items_emb_full.detach().cpu(),
+                'seed': SEED,
+                'hidden_dim': HIDDEN_DIM,
+            },
+            'embeddings_checkpoint.pt',
+        )
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
