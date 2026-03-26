@@ -143,6 +143,10 @@ class ConditionalPolicy(nn.Module):
             Position within ``remaining_items`` (i.e. index into the
             *remaining* subpool, consistent with ``env.step(action)``).
         log_prob : torch.Tensor  scalar
+        normalized_entropy : torch.Tensor  scalar, optional
+            Entropy of the valid-action distribution normalized by
+            ``log(active_count)`` so values remain comparable as the candidate
+            pool shrinks during an episode.
         info : dict, optional
             Policy diagnostics for the chosen action.
         """
@@ -158,12 +162,13 @@ class ConditionalPolicy(nn.Module):
 
         log_probs = self.forward(state, weight, mask=mask)  # (num_candidates,)
         valid_log_probs = log_probs[:active_count]
+        local_action: int
 
         if greedy:
-            local_action = valid_log_probs.argmax().item()
+            local_action = int(valid_log_probs.argmax().item())
         else:
             probs = valid_log_probs.exp()
-            local_action = torch.multinomial(probs, num_samples=1).item()
+            local_action = int(torch.multinomial(probs, num_samples=1).item())
 
         log_prob = valid_log_probs[local_action]
         if not return_info:
@@ -171,13 +176,19 @@ class ConditionalPolicy(nn.Module):
 
         probs = valid_log_probs.exp()
         entropy = -(probs * valid_log_probs).sum()
+        if active_count > 1:
+            normalizer = torch.log(valid_log_probs.new_tensor(float(active_count)))
+            normalized_entropy = entropy / normalizer.clamp_min(1e-8)
+        else:
+            normalized_entropy = torch.zeros_like(entropy)
         info: Dict[str, float] = {
             'entropy': entropy.item(),
+            'normalized_entropy': normalized_entropy.item(),
             'selected_prob': probs[local_action].item(),
             'max_prob': probs.max().item(),
             'active_count': float(active_count),
         }
-        return local_action, log_prob, info
+        return local_action, log_prob, normalized_entropy, info
 
 
 def sample_weight_vector(
@@ -204,7 +215,7 @@ def sample_weight_vector(
     """
     concentration = torch.full((weight_dim,), alpha)
     dist = torch.distributions.Dirichlet(concentration)
-    w = dist.sample((batch_size,))  # (batch_size, weight_dim)
+    w = dist.sample(torch.Size((batch_size,)))  # (batch_size, weight_dim)
     if device is not None:
         w = w.to(device)
     if batch_size == 1:

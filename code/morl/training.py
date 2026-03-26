@@ -33,12 +33,15 @@ def run_episode(
     -------
     log_probs : List[torch.Tensor]   per-step log π(a_t | s_t, w)
     rewards   : torch.Tensor  shape (K, 3)  multi-objective reward vectors
+    entropy_terms : List[torch.Tensor] per-step normalized entropy values
     diagnostics : dict
     """
     state = env.reset(user_id).to(device)
     log_probs: List[torch.Tensor] = []
     reward_list: List[torch.Tensor] = []
+    entropy_terms: List[torch.Tensor] = []
     entropies: List[float] = []
+    normalized_entropies: List[float] = []
     selected_positions: List[int] = []
     selected_probs: List[float] = []
     max_probs: List[float] = []
@@ -48,8 +51,8 @@ def run_episode(
         if not remaining:
             break
 
-        action, log_prob, info = cast(
-            Tuple[int, torch.Tensor, Dict[str, float]],
+        action, log_prob, normalized_entropy, info = cast(
+            Tuple[int, torch.Tensor, torch.Tensor, Dict[str, float]],
             policy.select_action(state, weight, remaining, num_candidates, return_info=True),
         )
         state, reward, done = env.step(action)
@@ -57,7 +60,9 @@ def run_episode(
 
         log_probs.append(log_prob)
         reward_list.append(reward.to(device))
+        entropy_terms.append(normalized_entropy)
         entropies.append(info['entropy'])
+        normalized_entropies.append(info['normalized_entropy'])
         selected_positions.append(action)
         selected_probs.append(info['selected_prob'])
         max_probs.append(info['max_prob'])
@@ -69,11 +74,12 @@ def run_episode(
     diagnostics = {
         'episode_length': len(reward_list),
         'mean_entropy': sum(entropies) / len(entropies) if entropies else 0.0,
+        'mean_normalized_entropy': sum(normalized_entropies) / len(normalized_entropies) if normalized_entropies else 0.0,
         'selected_positions': selected_positions,
         'mean_selected_prob': sum(selected_probs) / len(selected_probs) if selected_probs else 0.0,
         'mean_max_prob': sum(max_probs) / len(max_probs) if max_probs else 0.0,
     }
-    return log_probs, rewards, diagnostics
+    return log_probs, rewards, entropy_terms, diagnostics
 
 
 def _safe_mean(values: Sequence[float]) -> float:
@@ -203,6 +209,7 @@ def train_morl(
     num_epochs: int = 200,
     batch_size: int = 64,
     lr: float = 1e-3,
+    entropy_coef: float = 0.01,
     checkpoint_dir: str = '.',
     checkpoint_every: int = 10,
     log_every: int = 10,
@@ -236,6 +243,7 @@ def train_morl(
     num_epochs : number of training epochs.
     batch_size : users per gradient step.
     lr : Adam learning rate.
+    entropy_coef : coefficient for normalized entropy regularization.
     checkpoint_dir : directory to save policy checkpoints.
     checkpoint_every : save every N epochs.
     device : compute device.
@@ -300,13 +308,14 @@ def train_morl(
     probe_user_ids = (probe_user_ids or [])[: min(len(probe_user_ids or []), 4)]
 
     logger.info(
-        'Starting MORL training: epochs=%d batch_size=%d K=%d M=%d lr=%.4g hidden_dim=%d failfast=%s',
+        'Starting MORL training: epochs=%d batch_size=%d K=%d M=%d lr=%.4g hidden_dim=%d entropy_coef=%.4g failfast=%s',
         num_epochs,
         batch_size,
         K,
         M,
         lr,
         hidden_dim,
+        entropy_coef,
         str(failfast_enabled),
     )
 
@@ -321,10 +330,12 @@ def train_morl(
         batch_users = [train_user_ids[i] for i in batch_users]
 
         all_log_probs: List[List[torch.Tensor]] = []
+        all_entropy_terms: List[List[torch.Tensor]] = []
         all_returns: List[float] = []
         reward_component_means: List[List[float]] = []
         episode_lengths: List[float] = []
         entropies: List[float] = []
+        normalized_entropies: List[float] = []
         selected_positions: List[int] = []
         selected_probs: List[float] = []
         max_probs: List[float] = []
@@ -332,16 +343,18 @@ def train_morl(
 
         for user_id in batch_users:
             w = sample_weight_vector(batch_size=1, device=dev)  # (3,)
-            log_probs, rewards, episode_diag = run_episode(
+            log_probs, rewards, entropy_terms, episode_diag = run_episode(
                 env, policy, user_id, w, M, dev
             )
             # Scalar episodic return: R = Σ_t  w · r_t
             R = torch.sum(rewards @ w).item()
             all_log_probs.append(log_probs)
+            all_entropy_terms.append(entropy_terms)
             all_returns.append(R)
             reward_component_means.append(rewards.mean(dim=0).detach().cpu().tolist())
             episode_lengths.append(float(episode_diag['episode_length']))
             entropies.append(episode_diag['mean_entropy'])
+            normalized_entropies.append(episode_diag['mean_normalized_entropy'])
             selected_positions.extend(episode_diag['selected_positions'])
             selected_probs.append(episode_diag['mean_selected_prob'])
             max_probs.append(episode_diag['mean_max_prob'])
@@ -351,12 +364,20 @@ def train_morl(
         baseline = sum(all_returns) / len(all_returns)
 
         policy_loss_terms: List[torch.Tensor] = []
-        for log_probs, R in zip(all_log_probs, all_returns):
+        entropy_bonus_terms: List[torch.Tensor] = []
+        for log_probs, entropy_terms, R in zip(all_log_probs, all_entropy_terms, all_returns):
             advantage = R - baseline
             episode_loss = -sum(log_probs) * advantage
+            if entropy_terms:
+                episode_entropy_bonus = torch.stack(entropy_terms).mean()
+            else:
+                episode_entropy_bonus = torch.tensor(0.0, device=dev)
+            episode_loss = episode_loss - entropy_coef * episode_entropy_bonus
             policy_loss_terms.append(episode_loss)
+            entropy_bonus_terms.append(episode_entropy_bonus)
 
         policy_loss = torch.stack(policy_loss_terms).mean()
+        mean_entropy_bonus = torch.stack(entropy_bonus_terms).mean().item() if entropy_bonus_terms else 0.0
         optimizer.zero_grad()
         policy_loss.backward()
         grad_norm = _grad_norm(policy)
@@ -382,6 +403,9 @@ def train_morl(
             'std_reward_health': _safe_std(reward_health),
             'std_reward_div': _safe_std(reward_div),
             'mean_entropy': _safe_mean(entropies),
+            'mean_normalized_entropy': _safe_mean(normalized_entropies),
+            'mean_entropy_bonus': mean_entropy_bonus,
+            'entropy_coef': entropy_coef,
             'mean_selected_prob': _safe_mean(selected_probs),
             'mean_max_prob': _safe_mean(max_probs),
             'mean_action_position': _safe_mean([float(position) for position in selected_positions]),
@@ -454,7 +478,7 @@ def train_morl(
         if epoch % log_every == 0:
             logger.info(
                 'Epoch %4d | loss=%.4f return=%.4f±%.4f | reward[p/h/d]=%.4f/%.4f/%.4f | '
-                'entropy=%.4f grad=%.4f action_pos_mean=%.2f',
+                'entropy=%.4f entropy_norm=%.4f grad=%.4f action_pos_mean=%.2f',
                 epoch,
                 epoch_stats['policy_loss'],
                 epoch_stats['mean_return'],
@@ -463,12 +487,19 @@ def train_morl(
                 epoch_stats['mean_reward_health'],
                 epoch_stats['mean_reward_div'],
                 epoch_stats['mean_entropy'],
+                epoch_stats['mean_normalized_entropy'],
                 epoch_stats['grad_norm'],
                 epoch_stats['mean_action_position'],
             )
 
         if epoch_stats['mean_entropy'] < 0.05:
             logger.warning('Epoch %d action entropy is very low (%.4f); exploration may have collapsed.', epoch, epoch_stats['mean_entropy'])
+        if epoch_stats['mean_normalized_entropy'] < 0.1:
+            logger.warning(
+                'Epoch %d normalized action entropy is very low (%.4f); the policy is becoming too deterministic over the active action set.',
+                epoch,
+                epoch_stats['mean_normalized_entropy'],
+            )
         if epoch_stats['std_reward_pref'] < 1e-4 and epoch_stats['std_reward_health'] < 1e-4 and epoch_stats['std_reward_div'] < 1e-4:
             logger.warning('Epoch %d reward variance is nearly zero across the batch.', epoch)
 

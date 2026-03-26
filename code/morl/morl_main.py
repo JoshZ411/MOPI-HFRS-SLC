@@ -92,6 +92,8 @@ def main():
     parser.add_argument('--M', type=int, default=200, help='Candidate pool size.')
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--hidden_dim', type=int, default=256)
+    parser.add_argument('--entropy_coef', type=float, default=0.01,
+                        help='Coefficient for normalized entropy regularization in the REINFORCE loss.')
     parser.add_argument('--disable_failfast', action='store_true',
                         help='Disable probe-based fail-fast guardrail in training.')
     parser.add_argument('--failfast_patience', type=int, default=3,
@@ -254,6 +256,7 @@ def main():
         num_epochs=args.epochs,
         batch_size=args.batch_size,
         lr=args.lr,
+        entropy_coef=args.entropy_coef,
         checkpoint_dir=args.output_dir,
         log_every=args.log_every,
         metrics_path=metrics_path,
