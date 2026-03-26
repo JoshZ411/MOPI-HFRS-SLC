@@ -1,39 +1,32 @@
 """
-Conditional policy network π(a | s, w) for MORL sequential recommendation.
+Policy network π(a | s, C) for MORL sequential recommendation.
 
-The policy encodes the environment state s_t and builds separate objective
-logits for preference, health, and diversity. The final action logits are a
-weighted sum of those objective-specific logits using w ∈ Δ².
+The policy encodes the environment state s_t and scores each candidate item
+embedding directly. There is no preference-weight conditioning.
 
 Architecture:
     state encoder: s_t → Linear → ReLU → Linear → ReLU
-    objective heads:
-        logits_pref(s_t), logits_health(s_t), logits_div(s_t)
-    composition:
-        logits = w_pref*logits_pref + w_health*logits_health + w_div*logits_div
-    → mask already-selected items (set to −∞)
+    candidate encoder: c_i → Linear → ReLU
+    scorer:
+        logits_i = <state_hidden, candidate_hidden_i>
     → Softmax → action probabilities
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, List, Optional
+from typing import Dict, Optional
 
 
 class ConditionalPolicy(nn.Module):
-    """Conditional policy π(a | s, w) for trade-off-aware sequential recommendation.
+    """Policy π(a | s, C) for sequential recommendation.
 
     Parameters
     ----------
     state_dim : int
         Dimensionality of the environment state (2*d + tag_dim + 1).
-    num_candidates : int
-        Maximum candidate pool size M.  The output head is fixed to this
-        size; invalid (already-selected) actions are masked to −∞.
-    weight_dim : int
-        Dimensionality of the preference weight vector (default 3 for
-        [w_pref, w_health, w_div]).
+    candidate_dim : int
+        Dimensionality of each candidate item embedding.
     hidden_dim : int
         Width of hidden layers (default 256).
     """
@@ -41,14 +34,13 @@ class ConditionalPolicy(nn.Module):
     def __init__(
         self,
         state_dim: int,
-        num_candidates: int,
-        weight_dim: int = 3,
+        candidate_dim: int,
         hidden_dim: int = 256,
     ):
         super().__init__()
         self.state_dim = state_dim
-        self.num_candidates = num_candidates
-        self.weight_dim = weight_dim
+        self.candidate_dim = candidate_dim
+        self.hidden_dim = hidden_dim
 
         self.state_encoder = nn.Sequential(
             nn.Linear(state_dim, hidden_dim),
@@ -56,28 +48,25 @@ class ConditionalPolicy(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
         )
-        self.pref_head = nn.Linear(hidden_dim, num_candidates)
-        self.health_head = nn.Linear(hidden_dim, num_candidates)
-        self.div_head = nn.Linear(hidden_dim, num_candidates)
+        self.candidate_encoder = nn.Sequential(
+            nn.Linear(candidate_dim, hidden_dim),
+            nn.ReLU(),
+        )
 
     def forward(
         self,
         state: torch.Tensor,
-        weight: torch.Tensor,
-        mask: Optional[torch.Tensor] = None,
+        candidate_embeddings: torch.Tensor,
     ) -> torch.Tensor:
-        """Compute action log-probabilities.
+        """Compute action log-probabilities over the active candidate set.
 
         Parameters
         ----------
         state : torch.Tensor
             Shape (state_dim,) or (batch, state_dim).
-        weight : torch.Tensor
-            Shape (weight_dim,) or (batch, weight_dim).
-        mask : torch.Tensor, optional
-            Boolean tensor of shape (num_candidates,) or (batch, num_candidates).
-            ``True`` means the action is *valid* (not yet selected).
-            Actions with mask==False are set to −∞ before softmax.
+        candidate_embeddings : torch.Tensor
+            Shape (num_candidates, candidate_dim) or
+            (batch, num_candidates, candidate_dim).
 
         Returns
         -------
@@ -87,24 +76,11 @@ class ConditionalPolicy(nn.Module):
         batched = state.dim() == 2
         if not batched:
             state = state.unsqueeze(0)
-            weight = weight.unsqueeze(0)
-            if mask is not None:
-                mask = mask.unsqueeze(0)
+            candidate_embeddings = candidate_embeddings.unsqueeze(0)
 
         state_hidden = self.state_encoder(state)  # (batch, hidden_dim)
-
-        logits_pref = self.pref_head(state_hidden)
-        logits_health = self.health_head(state_hidden)
-        logits_div = self.div_head(state_hidden)
-
-        # Enforce weight-conditioning by construction at the logit level.
-        w_pref = weight[:, 0].unsqueeze(-1)
-        w_health = weight[:, 1].unsqueeze(-1)
-        w_div = weight[:, 2].unsqueeze(-1)
-        logits = w_pref * logits_pref + w_health * logits_health + w_div * logits_div
-
-        if mask is not None:
-            logits = logits.masked_fill(~mask, float('-inf'))
+        candidate_hidden = self.candidate_encoder(candidate_embeddings)
+        logits = torch.einsum('bh,bnh->bn', state_hidden, candidate_hidden)
 
         log_probs = F.log_softmax(logits, dim=-1)
 
@@ -116,52 +92,39 @@ class ConditionalPolicy(nn.Module):
     def select_action(
         self,
         state: torch.Tensor,
-        weight: torch.Tensor,
-        remaining_items: List[int],
-        num_candidates: int,
+        candidate_embeddings: torch.Tensor,
         greedy: bool = False,
         return_info: bool = False,
     ):
-        """Sample (or greedily select) an action from the remaining candidate pool.
+        """Sample (or greedily select) an action from the active candidate set.
 
         Parameters
         ----------
         state : torch.Tensor  shape (state_dim,)
-        weight : torch.Tensor  shape (weight_dim,)
-        remaining_items : List[int]
-            Global item IDs still available in the current candidate pool.
-            The policy head operates over local candidate-pool positions, so
-            only the current pool length is used here.
-        num_candidates : int
-            Total pool size M (used to build the mask).
+        candidate_embeddings : torch.Tensor
+            Shape (num_candidates, candidate_dim) for the remaining local pool.
         greedy : bool
             If True, select the highest-probability action (for evaluation).
 
         Returns
         -------
         action : int
-            Position within ``remaining_items`` (i.e. index into the
-            *remaining* subpool, consistent with ``env.step(action)``).
+            Position within the current local candidate set, consistent with
+            ``env.step(action)``.
         log_prob : torch.Tensor  scalar
         normalized_entropy : torch.Tensor  scalar, optional
             Entropy of the valid-action distribution normalized by
-            ``log(active_count)`` so values remain comparable as the candidate
-            pool shrinks during an episode.
+            ``log(num_candidates)`` so values remain comparable as the candidate
+            set shrinks during an episode.
         info : dict, optional
             Policy diagnostics for the chosen action.
         """
-        mask = torch.zeros(num_candidates, dtype=torch.bool, device=state.device)
-        active_count = min(len(remaining_items), num_candidates)
+        active_count = int(candidate_embeddings.size(0))
         if active_count == 0:
             raise ValueError('select_action called with an empty candidate pool')
 
-        # The policy head is defined over candidate-pool slots [0, M). The
-        # environment keeps global item IDs in its remaining list, so valid
-        # actions are the active local positions [0, len(remaining_items)).
-        mask[:active_count] = True
-
-        log_probs = self.forward(state, weight, mask=mask)  # (num_candidates,)
-        valid_log_probs = log_probs[:active_count]
+        log_probs = self.forward(state, candidate_embeddings)
+        valid_log_probs = log_probs
         local_action: int
 
         if greedy:
@@ -189,35 +152,3 @@ class ConditionalPolicy(nn.Module):
             'active_count': float(active_count),
         }
         return local_action, log_prob, normalized_entropy, info
-
-
-def sample_weight_vector(
-    batch_size: int = 1,
-    weight_dim: int = 3,
-    alpha: float = 1.0,
-    device: Optional[torch.device] = None,
-) -> torch.Tensor:
-    """Sample preference weight vectors from a symmetric Dirichlet distribution.
-
-    Parameters
-    ----------
-    batch_size : int
-    weight_dim : int
-        Dimension of the simplex (default 3 for pref / health / div).
-    alpha : float
-        Dirichlet concentration parameter.  alpha=1 gives a uniform
-        distribution over the simplex.
-    device : torch.device
-
-    Returns
-    -------
-    w : torch.Tensor  shape (batch_size, weight_dim) or (weight_dim,) if batch_size==1
-    """
-    concentration = torch.full((weight_dim,), alpha)
-    dist = torch.distributions.Dirichlet(concentration)
-    w = dist.sample(torch.Size((batch_size,)))  # (batch_size, weight_dim)
-    if device is not None:
-        w = w.to(device)
-    if batch_size == 1:
-        w = w.squeeze(0)
-    return w
