@@ -1,0 +1,17 @@
+.vscode/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+*.csv
+*.json
+*.h5
+*.pt
+*.ckpt
+*.tar.gz
+*.zip
+*.jsonl
+processed_data/
+data/
+wandb/
