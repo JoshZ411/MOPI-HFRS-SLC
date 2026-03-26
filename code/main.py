@@ -1,5 +1,6 @@
 from RCSYS_utils import *
 import argparse
+import os
 from RCSYS_models import *
 from utils import *
 import wandb
@@ -147,6 +148,35 @@ def main():
 
         if epoch % args.iters_per_lr_decay == 0 and epoch != 0:
             scheduler.step()
+
+    # Save model and metadata for constrained reranker
+    checkpoint_dir = '../checkpoints'
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'user_tags': user_tags.cpu(),
+        'food_tags': food_tags.cpu(),
+        'user_features': user_features.cpu(),
+        'food_features': food_features.cpu(),
+        'num_users': num_users,
+        'num_foods': num_foods,
+        'feature_dict': {k: v.cpu() for k, v in feature_dict.items()},
+        'train_edge_index': train_edge_index.cpu(),
+        'val_edge_index': val_edge_index.cpu(),
+        'test_edge_index': test_edge_index.cpu(),
+        'pos_train_edge_index': pos_train_edge_index.cpu(),
+        'neg_train_edge_index': neg_train_edge_index.cpu(),
+        'pos_val_edge_index': pos_val_edge_index.cpu(),
+        'neg_val_edge_index': neg_val_edge_index.cpu(),
+        'pos_test_edge_index': pos_test_edge_index.cpu(),
+        'neg_test_edge_index': neg_test_edge_index.cpu(),
+        'seed': SEED,
+        'K': args.K,
+        'hidden_dim': HIDDEN_DIM,
+        'layers': LAYERS,
+        'feature_threshold': TH,
+    }, f'{checkpoint_dir}/sgsl_checkpoint.pt')
+    print(f"Checkpoint saved to {checkpoint_dir}/sgsl_checkpoint.pt")
 
     with torch.no_grad():
         model.eval()
