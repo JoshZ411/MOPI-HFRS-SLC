@@ -1,336 +1,439 @@
-# MO-DQN Sequential MORL Pivot Automation Plan
+# Constrained Rerank Pivot Automation Plan
 
 You are an AI coding agent operating inside the MOPI-HFRS repository.
 
-Your objective is to augment the MOPI-HFRS pipeline by adding a sequential MORL recommendation stage that operates on frozen embeddings post-training, without modifying the SGSL training phase.
+Your objective is to build, from scratch, a constrained reranker that augments the original one-shot MOPI-HFRS outputs while preserving ranking quality as a hard constraint.
 
-CRITICAL CONSTRAINTS:
-- DO NOT modify SGSL backbone, graph preprocessing, or health tag enrichment.
-- DO NOT alter GNN training loop or pareto_loss (MGDA gradient balancing).
-- DO NOT modify main.py training mechanics.
-- SGSL + MGDA training completes unchanged; embeddings are frozen for RL.
-- MORL replaces the inference-time recommendation mechanism (one-shot Pareto ranking → sequential list construction).
+## Mission
 
-Pipeline architecture:
-```
-SGSL Training (MGDA multi-obj balancing) 
-    → Frozen user/item embeddings 
-    → MORL sequential list construction
-    → Evaluation: baseline (one-shot) vs MORL (sequential)
-```
+Build a constrained rerank stage with these properties:
+- no inference-time tradeoff vector input,
+- baseline SGSL ranking semantics preserved,
+- strict relevance guardrails first,
+- secondary metric optimization (health/diversity/coverage) only within feasible edits,
+- deterministic fallback to baseline anchor list when constraints reject edits.
 
----
+## Why this pivot exists
 
-# IMPLEMENTATION ARCHITECTURE: Inference-Time Augmentation
+Prior sequential MORL trials failed the ranking floor by large margins despite extensive tuning.
+Root cause: attempting to optimize the same target as the SGSL ranker in a higher-variance RL loop produced unstable tradeoffs and ranking degradation.
 
-**Goal:** Replace one-shot Pareto ranking with sequential MORL policy at recommendation time; leave training phase untouched.
+This new design treats ranking as a hard feasibility contract, not a soft objective.
 
-**Workflow:**
-1. Run `python main.py` normally: SGSL trains with MGDA multi-objective loss balancing (unchanged).
-2. After training completes: extract frozen embeddings to checkpoint.
-3. Create separate MORL training pipeline in `/code/morl/` that loads frozen embeddings.
-4. MORL trains conditional policy π(a|s,w) on frozen embeddings.
-5. Evaluation: 
-   - Baseline: one-shot Pareto-optimal ranking from main.py eval
-   - MORL: sequential K-step list construction using trained policy
-   - Compare metrics on same frozen embeddings.
+## Critical constraints (must not be violated)
 
-**No modifications to main.py training loop or pareto_loss.**
+- DO NOT modify SGSL architecture in `code/RCSYS_models.py`.
+- DO NOT modify graph preprocessing/tag enrichment pipeline.
+- DO NOT modify MGDA logic used by original SGSL training in `code/RCSYS_utils.py`.
+- DO NOT introduce a new unconstrained sequential RL policy as primary ranker.
+- DO NOT require any inference-time user preference vector.
+- All comparisons MUST be apples-to-apples with baseline evaluation protocol.
 
-**Code organization:**
-```
-code/
-  main.py (unchanged; adds one line: embedding checkpoint save)
-  morl/
-    environment.py (RL environment)
-    policy.py (conditional policy network)
-    training.py (MORL training loop)
-    morl_main.py (entry point)
-  RCSYS_*.py (unchanged)
-  utils.py (reused for evaluation)
-```
+## Mandatory prerequisite: deep codebase understanding
 
-**Contribution framing:**
-- **MGDA:** gradient-space multi-objective compromise during GNN training (learning phase).
-- **MORL:** policy-space horizon-aware trade-off allocation during recommendation (inference phase).
-Both operate on identical frozen embeddings.
+BEFORE writing any constrained reranker code, you MUST read and document the following:
 
----
+1. Baseline training and checkpoint flow
+- Read `code/main.py` end-to-end.
+- Identify where user/item embeddings are produced and how baseline evaluation is run.
+- Confirm what checkpoint artifacts already exist and what can be safely reused.
 
-# KEY ASSUMPTIONS & DESIGN CHOICES
+2. Baseline evaluation and metric semantics
+- Read metric/eval utilities in `code/RCSYS_utils.py` used by baseline val/test reporting.
+- Document exact definitions for ndcg, recall, precision, health-related metrics, diversity, and coverage-like outputs used in repo.
+- Document split handling and exclusion masking behavior (train exclusion for val/test, and any additional test-time exclusions used by baseline).
 
-Before implementation, lock these decisions:
+3. Data and split contract
+- Confirm split creation path and split identifiers in the repository.
+- Confirm which edges are considered seen history versus target positives for each split.
+- Confirm that constrained rerank evaluation can be run on the same split protocol with no leakage.
 
-**GPU:** A100 will be available. Default to `device="cuda"` throughout.
+4. Existing dependency/runtime constraints
+- Confirm CPU/CUDA behavior for the repo environment and checkpoint portability expectations.
+- Confirm required package imports for evaluation path work in the active environment.
 
-**Embedding freezing:** GNN training completes; user/item embeddings are frozen (no backprop during RL).
+5. W&B logging patterns (required for this pivot)
+- Implement W&B offline logging for constrained rerank runs (do not skip).
+- Track both baseline-vs-rerank metrics and constrained diagnostics per run.
+- Persist a reproducible `wandb beta leet run` command in output artifacts.
 
-**Candidate pool size M:** Top-M items per user governs action space size.
-- Current baseline: TBD (recommend 100–200 items; will tune based on memory).
-- Pools computed once at start; reused across entire RL training.
+Implementation notes requirement:
+- Add a short section in `auto_logs.md` titled `Prerequisite Understanding` before Phase 0 execution.
+- Summarize baseline flow, metrics, masking, and split semantics in concrete bullet points.
 
-**Reward aggregation:** Per-step rewards [r_pref, r_health, r_div] are scalarized only for policy gradient updates.
-- Storage: environment returns full 3-dim vector.
-- Validation: evaluate all three objectives independently.
+Verification checklist (do not skip):
+- [ ] Can you explain baseline one-shot inference/evaluation flow from `code/main.py` without ambiguity?
+- [ ] Can you point to the exact metric functions and explain their outputs used for comparison?
+- [ ] Can you state the exact masking policy used for val and test evaluation?
+- [ ] Can you show that constrained rerank will use the same split/masking protocol?
+- [ ] Can you describe the run-level W&B metrics and where they are logged in code?
 
-**Tag encoding:** Binary union vector (|food_tags| dimensions); cumulative OR operation during episode.
+If any checklist item is unanswered, STOP. Do not begin constrained reranker implementation.
 
-**State dimensionality:** d_user + d_user + |food_tags| + 1 = 2·d_aggregated + tag_dim + 1.
+## Pipeline architecture
 
-**Batch sampling:** Small batch (32–64 users) sufficient for discrete action space; no memory bottleneck on A100s expected.
+SGSL Training (existing multi-objective GNN path, unchanged)
+-> Frozen user/item embeddings
+-> Constrained reranker (anchor list + bounded feasible edits)
+-> Single-path evaluation on val/test
+-> Baseline (one-shot) vs Constrained rerank comparison
 
-**Evaluation protocol:** Standard train/val/test split (60/20/20); exclude seen training interactions from ranking at test time.
+Implementation contract:
+- Constrained reranker is an inference-time augmentation on top of frozen embeddings.
+- SGSL training phase remains unchanged.
+- Baseline and reranked outputs must be compared on identical splits, masks, and metric definitions.
 
----
+## Why this design is chosen (lessons from prior experiments)
 
-MGDA provides a locally Pareto-feasible gradient direction (myopic compromise). We aim to learn long-horizon policies that approximate the achievable trade-offs of sequential recommenders.
+Prior experiments surfaced failures this design avoids:
 
-Instead of selecting a single compromise during training (as MGDA does), we train a conditional policy that can model different trade-offs over full K-step recommendation trajectories.
+1. Objective mismatch in noisy RL loop
+- Trying to relearn the same ranking target as SGSL in higher-variance RL degraded ranking.
 
-Final operating point selection will be done via validation metrics.
+2. Soft-tradeoff instability
+- Multi-objective policy tradeoffs improved secondary metrics while violating hard ranking floor.
 
----
+3. Unclear acceptance behavior
+- Without hard feasibility gates and deterministic fallback, behavior drifted and was hard to debug.
 
-# PHASE 1: Embedding Extraction (Post-Training)
+This plan fixes those issues by enforcing hard constraints around baseline ranking and optimizing only inside feasible edit space.
 
-Goal: Save frozen embeddings after SGSL training completes; prepare for MORL.
+## Existing code references to reuse
 
-Step 1: Verify SGSL/MGDA training completes normally.
-- Run standard `python main.py`.
-- No modifications to training loop or pareto_loss.
-- MGDA gradient balancing operates as designed.
+Primary references in original framework:
 
-Step 2: Add minimal checkpoint save.
-- After training completes (after test eval), save frozen embeddings.
-- One-line addition to main.py (post-training, no loop changes):
-  ```python
-  torch.save({'user_emb': users_emb_final.detach().cpu(), 
-              'item_emb': items_emb_final.detach().cpu()}, 
-             'embeddings_checkpoint.pt')
-  ```
+- `code/main.py`
+   - Existing SGSL training/eval orchestration.
+   - Keep one-shot baseline path intact.
 
-Step 3: Create MORL entry point in `morl/morl_main.py`.
-- Load frozen embeddings from checkpoint.
-- Load user/item health tags.
-- Proceed to Phases 2–6 (environment, policy, training).
+- `code/RCSYS_utils.py`
+   - Existing split/eval and metric ecosystem.
+   - Reuse metric semantics and masking behavior.
 
-SGSL training pipeline completely untouched. MORL operates entirely post-hoc on frozen embeddings.
+- `code/RCSYS_models.py`, `code/utils.py`
+   - Embedding ecosystem and utilities; do not redesign.
 
-Deliverable:
-    - `embeddings_checkpoint.pt` saved after SGSL training.
-    - MORL module loads checkpoint; trains policy independently.
-    - main.py remains functionally equivalent (one save call added at end).
+These files define baseline semantics and must guide parity-safe constrained rerank evaluation.
 
----
+## Phase 0: Baseline parity lock (do not skip)
 
-# PHASE 2: Candidate Pool Construction
+Goal: ensure baseline metrics are comparable before any reranker code is written.
 
-Goal: Define discrete action space for sequential MDP.
+Tasks:
+1. Read baseline flow in `code/main.py` and evaluation helpers in `code/RCSYS_utils.py`.
+2. Confirm split protocol and masking behavior used by baseline one-shot evaluation.
+3. Freeze baseline reference artifacts:
+   - val metrics,
+   - test metrics,
+   - eval configuration (K, split ids, masking policy, seed).
+4. Create parity checklist in code comments/docs:
+   - same splits,
+   - same K,
+   - same exclusion masking,
+   - same metric functions.
 
-Step 1: Generate candidate pools per user.
-- Use baseline scoring: score = user_emb · item_emb^T
-- Select top-M items per user (M ∈ {100, 200, 500}; TBD based on memory/runtime).
-- Clarification: Do NOT exclude training positives from pools during RL training
-  (GNN is frozen; RL explores all top-M rankings).
-- At evaluation/test time, exclude training/validation edges per standard protocol.
+Hard gate:
+- If parity cannot be demonstrated, STOP. Do not implement reranker yet.
 
-Step 2: Store candidate pools.
-- Pools remain fixed during RL training.
-- No dynamic re-ranking at this stage.
-
-Deliverable:
-    candidate_pools[user_id] → list of M item_ids
+Deliverables:
+- Baseline parity record in `auto_logs.md`.
+- Saved baseline metrics JSON under output dir.
 
 ---
 
-# PHASE 3: MDP Definition (Sequential List Construction)
+## Phase 1: Scope reset and architecture contract
 
-Goal: Formalize deterministic environment.
+Goal: codify constrained reranker as post-ranking augmentation, not replacement ranker.
 
-State s_t:
-    - user embedding (d-dim)
-    - aggregated embedding of selected items: mean pooling over [i_1, ..., i_{t-1}] (initialized to zero vector at t=0)
-    - cumulative health tag coverage: binary vector encoding union of selected items' tags
-    - normalized timestep t/K
+Architecture:
+1. Baseline anchor list:
+   - one-shot top-K from frozen embeddings and existing masking rules.
+2. Reranker:
+   - proposes bounded edits to positions in anchor list.
+3. Feasibility layer:
+   - enforces hard constraints.
+4. Fallback:
+   - if proposal violates constraints, use anchor item.
 
-Action:
-    - select next item from candidate pool (masked to prevent duplicates).
-    - Terminal state masking: if candidate pool exhausted (|remaining| = 0), 
-      terminate episode early.
+Required objective hierarchy (lexicographic):
+1. Primary: relevance/ranking floor compliance.
+2. Secondary: health/diversity/coverage improvements.
 
-Transition:
-    - append selected item to list
-    - update aggregated embedding via mean update
-    - update tag union (bitwise OR of item tags)
-    - increment timestep t → t+1
+Forbidden in v1:
+- training a full unconstrained MORL policy,
+- exposure-allocation policy learning,
+- simulator-based long-horizon RL.
 
-Episode ends after K selections (K=20 per baseline).
-
-Deliverable:
-    Deterministic K-step list-construction environment with state/action/transition specs.
-
----
-
-# PHASE 4: Multi-Objective Reward Structure
-
-Goal: Define interpretable, decomposed reward signals.
-
-Per-step reward components:
-    r_pref_t:
-        Based on preference loss (BPR-style ranking).
-        Computed from interactions between user_emb and selected item_emb.
-    r_health_t:
-        Jaccard similarity between cumulative tag coverage and user profile tags.
-    r_div_t:
-        Penalize selecting items with high embedding similarity to already-selected items.
-        Compute as negative mean cosine similarity within current list.
-
-Return reward vector per step:
-    r_t = [r_pref_t, r_health_t, r_div_t]
-
-Scalarized episodic return (for optimization):
-    R = ∑_t w · r_t  (where w is sampled weight vector).
-
-Deliverable:
-    Environment returns multi-objective reward vector per step; scalarization happens in training loop.
+Deliverables:
+- Contract section in docs and module docstrings.
 
 ---
 
-# PHASE 5: Conditional MORL Policy
+## Phase 2: New package and file map
 
-Goal: Learn a trade-off-aware policy.
+Goal: establish clean implementation boundaries.
 
-Approach:
-    Train conditional policy π(a | s, w)
+Create package:
+- `code/constrained_rerank/`
+  - `__init__.py`
+  - `anchor.py`              # baseline anchor generation and score extraction
+  - `constraints.py`         # feasibility checks (lock, margin, budget, duplicates)
+  - `reranker.py`            # constrained edit executor
+  - `evaluation.py`          # parity-safe eval wrappers + diagnostics
+  - `main.py`                # CLI entrypoint
+  - `logging_utils.py`       # structured json logging + optional wandb wrapper
+  - `README_CONSTRAINED_RERANK.md`
 
-Where:
-    w = preference vector sampled from simplex
-    w ∈ ℝ^3, w_i ≥ 0, sum(w_i) = 1
+Keep untouched:
+- existing SGSL training path in `code/main.py`.
 
-Step 1: Extend state:
-    s'_t = concat(s_t, w)
-
-Step 2: During training:
-    - Sample weight vector w (Dirichlet distribution)
-    - Run K-step episode conditioned on w
-    - Compute scalar reward for optimization using:
-          R_t = w · r_t
-    - Apply standard policy gradient update
-      (REINFORCE with baseline is sufficient)
-
-Deliverable:
-    Single conditional policy capable of producing different trade-offs.
+Deliverables:
+- Package skeleton committed and importable.
 
 ---
 
-# PHASE 6: Training Loop
+## Phase 3: Anchor list and candidate construction
 
-Goal: Stable episodic training across trade-offs.
+Goal: deterministic anchor generation consistent with baseline semantics.
 
-Configuration:
-    - Batch size: 32–64 users per gradient step (adjust per GPU memory on A100s).
-    - Weight sampling: Dirichlet(α = [1,1,1]) for symmetric preference distribution.
+Tasks:
+1. Load frozen embeddings from checkpoint.
+2. For each user, compute ranked candidates using baseline-compatible score function.
+3. Apply same exclusion masking as baseline evaluation.
+4. Build:
+   - anchor top-K item ids,
+   - per-position anchor relevance scores,
+   - optional top-M pool for swap candidates.
 
-Step 1: Sample batch of users (size B).
-Step 2: For each user:
-    - Sample weight vector w from Dirichlet simplex
-    - Run K-step episode with sampled w
-    - Collect trajectory {s_t, a_t, r_t} for t=0..K-1
-Step 3: Aggregate rewards:
-    R_episode = ∑_t w · r_t (scalar per episode)
-Step 4: Update policy via REINFORCE:
-    ∇ log π(a_t | s_t, w) * R_episode
+Rules:
+- Anchor generation must be deterministic for fixed seed.
+- No learned policy required in v1.
 
-No gradients flow into GNN.
-No retraining of embeddings.
-
-Checkpoint:
-    - policy parameters (network weights)
-    - training statistics (per-objective returns, policy loss trajectories)
-
-Deliverable:
-    Trained conditional MORL policy π(a | s, w).
+Deliverables:
+- `anchor.py` with tested API:
+  - `get_anchor_list_and_scores(user_id, K, ...)`.
 
 ---
 
-# PHASE 7: Trade-Off Selection via Validation Metrics
+## Phase 4: Hard constraints and edit mechanics
 
-Goal: Select final operating point empirically.
+Goal: bounded feasible edits only.
 
-Step 1: Define small grid of weight vectors W_eval.
-    - (10–20 evenly spaced preference vectors sampled from simplex).
-    - Include corner points (1,0,0), (0,1,0), (0,0,1) + uniform weights.
+Required constraints:
+1. Position lock:
+   - positions 1..L are immutable anchor (default L=6).
+2. Score-margin gate:
+   - candidate score must satisfy `cand_score >= anchor_score - epsilon`.
+3. Swap budget:
+   - max swaps per list (default 4).
+4. Duplicate prevention:
+   - no repeated item in final list.
 
-Step 2: For each w in W_eval:
-    - Generate Top-K lists on validation split (using π(· | s, w))
-    - Compute metrics:
-        - NDCG@K (preference quality)
-        - Health score (tag coverage alignment)
-        - Diversity score (mean pairwise dissimilarity in K-list)
+Fallback contract:
+- Any rejected edit -> force anchor item for that position.
 
-Step 3: Select operating weight w* using one of:
-    - Option A: Maximize (α·NDCG + β·Health) subject to Diversity ≥ threshold
-    - Option B: Lexicographic: prioritize NDCG, then break ties on Health
-    - Option C: Extract Pareto front; select median point
-    (Decision: TBD after Phase 6 validation results; default Option A with α=0.7, β=0.3)
+Diagnostics per list:
+- attempted swaps,
+- accepted swaps,
+- rejected by margin,
+- rejected by budget,
+- rejected by duplicate,
+- forced-anchor count.
 
-Final step: Evaluate π(· | s, w*) on test split.
-
-Deliverable:
-    Selected weight vector w*; test-set evaluation metrics under w*.
-
----
-
-# LOGGING AND DOCUMENTATION
-
-**Agent Responsibility:** Maintain a running log of all implementation work in `auto_logs.md`.
-
-Log after completing each phase and should include:
-- **Phase completion summary:** What was implemented, file paths created/modified.
-- **Key decisions made:** Any hyperparameter choices, design trade-offs, or ambiguities resolved.
-- **Git commits:** Reference any commits created during the phase.
-- **Blockers and resolutions:** Any issues encountered and how they were addressed.
-- **Code snippets:** Brief inline examples of critical functions/classes added.
-- **Next-phase notes:** Clarifications or assumptions that affect downstream phases.
-
-Format: Use markdown with phase headers (e.g., `## Phase 1: Embedding Extraction`) and timestamp entries where relevant.
-
-This log enables rapid investigation of implementation decisions and serves as a traceback for debugging or adjustments.
+Deliverables:
+- `constraints.py` and `reranker.py` with deterministic behavior.
 
 ---
 
-# CONTRIBUTION STATEMENT ALIGNMENT
+## Phase 5: CLI and runtime contract
 
-**SGSL + MGDA (Training):**
-- Multi-objective gradient balancing in embedding space during GNN training.
-- Balances preference, health, and diversity objectives at each epoch.
-- Produces a single set of compromised embeddings.
+Goal: reproducible runs on CPU/GPU without code edits.
 
-**MORL (Inference):**
-- Takes frozen embeddings; constructs recommendations sequentially.
-- Learns a conditional policy π(a|s,w) that adapts to preference weights.
-- Performs horizon-aware allocation of objectives across K recommendation steps.
-- Defers trade-off decisions to inference time (validation metric selection).
+CLI requirements in `code/constrained_rerank/main.py` (minimal required surface):
+- `--device cpu|cuda|auto`
+- `--K`
+- `--M`
+- `--anchor_lock_positions`
+- `--anchor_epsilon`
+- `--max_swaps_per_list`
+- `--output_dir`
 
-**Key difference:**
-- MGDA: myopic, parameter-space compromise during training.
-- MORL: foresighted, policy-space allocation during recommendation.
+Advanced optional flags (debug/ablation only, not required for normal runs):
+- `--seed`
+- `--train_user_limit`
+- `--val_user_limit`
+- `--exclude_seen_candidates`
 
-Both use identical frozen embeddings. MORL does not replace MGDA training; it augments the inference mechanism to exploit learned representations more effectively via sequential decision-making.
+Default behavior guidance:
+- Production/default path should rely on repo-consistent defaults and full splits.
+- Optional limit flags exist only to speed smoke tests and ablations.
+
+Device behavior:
+- `auto`: cuda if available else cpu,
+- `cuda`: fail clearly if unavailable,
+- checkpoint loading must be portable with `map_location`.
+
+Deliverables:
+- CLI run help output and config JSON saved per run.
 
 ---
 
-# END CONDITION
+## Phase 6: Evaluation protocol and acceptance gates
+
+Goal: evaluate constrained rerank against baseline with strict parity.
+
+Metrics to report (val and test):
+- ndcg,
+- recall,
+- precision,
+- health,
+- diversity,
+- coverage,
+- car (if present in baseline ecosystem).
+
+Constrained diagnostics to report:
+- aggregate swap rate,
+- aggregate rejection rate,
+- forced-anchor rate,
+- rejection breakdown by reason.
+
+Primary hard gate:
+- test ndcg drop fraction must be <= configured floor (default 0.07).
+
+Secondary utility gate:
+- non-negative trend in selected secondary metrics with non-zero accepted swaps.
+
+If hard gate fails:
+- mark run failed regardless of secondary gains.
+
+Deliverables:
+- `results.json` containing baseline, constrained, and diagnostics blocks.
+
+---
+
+## Phase 7: Incremental experiment matrix
+
+Goal: isolate contributions and avoid confounded conclusions.
+
+Run order (small smoke first):
+1. Config A: baseline-only reference (no edits).
+2. Config B: lock-only (positions 1..L locked, no margin/budget restriction beyond locks).
+3. Config C: lock + margin.
+4. Config D: lock + margin + budget (target v1).
+
+Protocol:
+- fixed seeds,
+- identical user subsets for matrix,
+- short runs first (smoke), then substantial run for selected config.
+
+Selection rule:
+- choose best config that passes hard ranking gate.
+- if none pass, stop and tighten constraints (epsilon/window/budget) before adding complexity.
+
+Deliverables:
+- comparison table in output dir and `auto_logs.md`.
+
+---
+
+## Phase 8: Decision tree for failures
+
+If baseline mismatch detected:
+- Stop, fix evaluation parity first.
+
+If ndcg floor fails:
+- tighten one dimension at a time in this order:
+  1. reduce editable window,
+  2. reduce epsilon,
+  3. reduce swap budget.
+
+If zero accepted swaps:
+- treat as over-constrained; relax one setting slightly and re-run smoke.
+
+If diagnostics missing/inconsistent:
+- fail run and fix instrumentation before further experiments.
+
+If duplicate selection occurs:
+- fail-fast with explicit error and patch duplicate-prevention logic.
+
+---
+
+## Phase 9: Logging and reproducibility
+
+Maintain `auto_logs.md` after each phase with:
+- files changed,
+- commands run,
+- metric snapshots,
+- gate pass/fail status,
+- blockers/fixes,
+- next phase decision.
+
+Artifacts required per run:
+- `run_config.json`,
+- `results.json`,
+- `train_metrics.jsonl` or `rerank_metrics.jsonl`,
+- wandb offline metadata,
+- `wandb_leet_command.txt`,
+- concise comparison table.
+
+W&B policy (required):
+- offline mode only,
+- must mirror JSON metrics; W&B is visualization, JSON is source of truth,
+- required run-level panels:
+   - baseline vs rerank metric deltas,
+   - ndcg_drop_fraction,
+   - swap/rejection/forced-anchor diagnostics,
+   - acceptance gate status.
+
+---
+
+## Phase 10: Acceptance criteria
+
+The constrained-rerank pivot is successful only if all are true:
+
+1. Baseline SGSL training/eval path remains unchanged.
+2. No inference-time tradeoff vector is required.
+3. Reranker edits are bounded and always feasibility-checked.
+4. Final list always valid (no duplicates, lock compliance, budget compliance).
+5. Test ranking floor passes (`ndcg_drop_fraction <= threshold`).
+6. Secondary metrics are at least neutral-to-improved under non-trivial edit activity.
+7. Full run is reproducible from saved config and commands.
+
+---
+
+## Non-goals (explicit)
+
+- Do not build a new MGDA RL training stage in this branch.
+- Do not retrain SGSL to force reranker gains.
+- Do not add simulator/planner infrastructure in v1.
+- Do not add exposure-allocation policy learning in v1.
+
+---
+
+## Quick-start commands (template)
+
+From `code/` directory:
+
+1. Baseline parity smoke:
+- `python main.py --seed 42 --K 20`
+
+2. Constrained rerank smoke:
+- `python constrained_rerank/main.py --device auto --K 20 --M 200 --anchor_lock_positions 6 --anchor_epsilon 0.05 --max_swaps_per_list 4 --output_dir constrained_rerank_smoke`
+
+3. Ablation matrix run:
+- run Config A/B/C/D with only constraint flags changing, same split and seed.
+
+4. Substantial run:
+- promote only best gate-passing config from matrix.
+
+---
+
+## End condition
 
 System produces:
-    - SGSL-trained GNN with frozen embeddings (MGDA-balanced).
-    - Trained conditional MORL policy π(a | s, w).
-    - Validation-selected trade-off weight w*.
-    
-Evaluation compares:
-    - Baseline: one-shot Pareto ranking (main.py inference) on same embeddings.
-    - MORL: sequential list construction using trained policy w*.
-    - Metrics: NDCG, health score, diversity, coverage on test set.
+- unchanged original SGSL path,
+- standalone constrained-rerank package,
+- parity-safe baseline vs constrained comparisons,
+- reproducible artifacts and phase logs,
+- clear pass/fail verdict against ranking floor.
 
-Proceed phase-by-phase.
-At the end of each phase, summarize implementation decisions and ambiguities before continuing.
+Proceed phase-by-phase and do not skip gates.
