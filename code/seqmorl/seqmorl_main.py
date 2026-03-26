@@ -30,12 +30,7 @@ if _CODE not in sys.path:
 from seqmorl.environment import SequentialRecEnv
 from seqmorl.policy import SequentialPolicy
 from seqmorl.training import train_implicit_morl
-from seqmorl.evaluation import evaluate_sequential, compare_baselines, compute_svs, compute_car
-from seqmorl.constrained_diagnostics import (
-    extract_constraint_stats_from_training_log,
-    print_constraint_diagnostics,
-    add_constraint_diagnostics_to_results,
-)
+from seqmorl.evaluation import evaluate_sequential, compare_baselines
 from seqmorl.logging_utils import WandbTracker, save_json
 from RCSYS_utils import split_data_new
 
@@ -130,10 +125,6 @@ def _oneshot_metrics(user_emb: torch.Tensor,
         'health': float(np.mean(health_vals)) if health_vals else 0.0,
         'diversity': float(np.mean(div_vals)) if div_vals else 0.0,
         'coverage': coverage,
-        'car': compute_car(
-            float(np.mean(rec_vals)) if rec_vals else 0.0,
-            float(np.mean(div_vals)) if div_vals else 0.0,
-        ),
     }
 
 
@@ -160,8 +151,6 @@ def main():
                         help='Learning rate.')
     parser.add_argument('--gamma', type=float, default=0.99,
                         help='Discount factor.')
-    parser.add_argument('--gae_lambda', type=float, default=0.95,
-                        help='GAE lambda for per-objective advantage estimation.')
     parser.add_argument('--K', type=int, default=20,
                         help='Recommendation list length.')
     parser.add_argument('--M', type=int, default=200,
@@ -198,16 +187,6 @@ def main():
                         help='Optional number of randomly shuffled train users used per epoch (0 = all train users).')
     parser.add_argument('--exclude_seen_candidates', type=int, default=1, choices=[0, 1],
                         help='Exclude seen train interactions when building candidate pools (1=enabled, 0=disabled).')
-    parser.add_argument('--test_ndcg_drop_floor', type=float, default=0.07,
-                        help='Maximum allowed fractional test NDCG drop vs one-shot baseline before flagging failure.')
-    parser.add_argument('--constrained_mode', type=int, default=0, choices=[0, 1],
-                        help='Enable anchor-based constrained reranking (1=enabled, 0=disabled).')
-    parser.add_argument('--anchor_epsilon', type=float, default=0.05,
-                        help='Score margin gate: candidate must score >= anchor_score - epsilon.')
-    parser.add_argument('--max_swaps_per_list', type=int, default=4,
-                        help='Maximum number of swaps allowed per top-K list in constrained mode.')
-    parser.add_argument('--anchor_lock_positions', type=int, default=6,
-                        help='Number of top positions (1-indexed) to keep locked to anchor in constrained mode.')
     args = parser.parse_args()
 
     # --- Device setup ---
@@ -329,14 +308,6 @@ def main():
     )
 
     compare_baselines(baseline_val, seq_val, split='val')
-    svs_val = compute_svs(baseline_val, seq_val)
-    print(
-        "[seqmorl] SVS (val): "
-        f"{svs_val['svs']:+.6f} "
-        f"[ndcg={svs_val['delta_ndcg']:+.6f}, "
-        f"health={svs_val['delta_health']:+.6f}, "
-        f"div={svs_val['delta_diversity']:+.6f}]"
-    )
 
     # --- One-shot baseline (test) ---
     print("[seqmorl] Computing one-shot baseline on test split …")
@@ -364,59 +335,13 @@ def main():
     )
 
     compare_baselines(baseline_test, seq_test, split='test')
-    svs_test = compute_svs(baseline_test, seq_test)
-    print(
-        "[seqmorl] SVS (test): "
-        f"{svs_test['svs']:+.6f} "
-        f"[ndcg={svs_test['delta_ndcg']:+.6f}, "
-        f"health={svs_test['delta_health']:+.6f}, "
-        f"div={svs_test['delta_diversity']:+.6f}]"
-    )
-
-    baseline_test_ndcg = float(baseline_test.get('ndcg', 0.0))
-    seq_test_ndcg = float(seq_test.get('ndcg', 0.0))
-    ndcg_drop_fraction = (
-        max(0.0, baseline_test_ndcg - seq_test_ndcg) / max(1e-8, baseline_test_ndcg)
-    )
-    ranking_floor_pass = ndcg_drop_fraction <= float(args.test_ndcg_drop_floor)
-    floor_status = "PASS" if ranking_floor_pass else "FAIL"
-    print(
-        "[seqmorl] Ranking floor check (test): "
-        f"{floor_status} | ndcg_drop_fraction={ndcg_drop_fraction:.4f} "
-        f"(limit={float(args.test_ndcg_drop_floor):.4f})"
-    )
-    
-    # Extract and report constraint diagnostics if running in constrained mode
-    constraint_stats = {}
-    if args.constrained_mode:
-        train_metrics_path = os.path.join(args.output_dir, 'train_metrics.jsonl')
-        constraint_stats = extract_constraint_stats_from_training_log(train_metrics_path)
-        if constraint_stats:
-            print_constraint_diagnostics(constraint_stats)
 
     # --- Save results ---
     results = {
         'args': vars(args),
-        'val': {
-            'baseline': baseline_val,
-            'sequential': seq_val,
-            'svs': svs_val,
-        },
-        'test': {
-            'baseline': baseline_test,
-            'sequential': seq_test,
-            'svs': svs_test,
-            'ranking_floor': {
-                'ndcg_drop_fraction': ndcg_drop_fraction,
-                'max_allowed_drop_fraction': float(args.test_ndcg_drop_floor),
-                'passed': bool(ranking_floor_pass),
-            },
-        },
+        'val': {'baseline': baseline_val, 'sequential': seq_val},
+        'test': {'baseline': baseline_test, 'sequential': seq_test},
     }
-    
-    # Add constraint diagnostics to results if available
-    results = add_constraint_diagnostics_to_results(results, constraint_stats)
-    
     results_path = os.path.join(args.output_dir, 'results.json')
     save_json(results_path, results)
     print(f"[seqmorl] Results saved to {results_path}")
