@@ -290,6 +290,9 @@ def train_morl(
         all_returns_pref: List[float] = []
         all_returns_health: List[float] = []
         all_returns_div: List[float] = []
+        all_advantages_pref: List[float] = []
+        all_advantages_health: List[float] = []
+        all_advantages_div: List[float] = []
         reward_component_means: List[List[float]] = []
         episode_lengths: List[float] = []
         entropies: List[float] = []
@@ -307,18 +310,25 @@ def train_morl(
             )
             all_log_probs.append(log_probs)
 
-            returns_pref = _normalize_returns(_discounted_returns(rewards['pref'], gamma))
-            returns_health = _normalize_returns(_discounted_returns(rewards['health'], gamma))
-            returns_div = _normalize_returns(_discounted_returns(rewards['div'], gamma))
+            raw_returns_pref = _discounted_returns(rewards['pref'], gamma)
+            raw_returns_health = _discounted_returns(rewards['health'], gamma)
+            raw_returns_div = _discounted_returns(rewards['div'], gamma)
+
+            returns_pref = _normalize_returns(raw_returns_pref)
+            returns_health = _normalize_returns(raw_returns_health)
+            returns_div = _normalize_returns(raw_returns_div)
 
             log_prob_tensor = torch.stack(log_probs)
             loss_pref_terms.append(-(log_prob_tensor * returns_pref.detach()).sum())
             loss_health_terms.append(-(log_prob_tensor * returns_health.detach()).sum())
             loss_div_terms.append(-(log_prob_tensor * returns_div.detach()).sum())
 
-            all_returns_pref.append(float(returns_pref.mean().detach().cpu()))
-            all_returns_health.append(float(returns_health.mean().detach().cpu()))
-            all_returns_div.append(float(returns_div.mean().detach().cpu()))
+            all_returns_pref.append(float(raw_returns_pref[0].detach().cpu()))
+            all_returns_health.append(float(raw_returns_health[0].detach().cpu()))
+            all_returns_div.append(float(raw_returns_div[0].detach().cpu()))
+            all_advantages_pref.append(float(returns_pref.mean().detach().cpu()))
+            all_advantages_health.append(float(returns_health.mean().detach().cpu()))
+            all_advantages_div.append(float(returns_div.mean().detach().cpu()))
             reward_component_means.append([
                 float(rewards['pref'].mean().detach().cpu()),
                 float(rewards['health'].mean().detach().cpu()),
@@ -383,6 +393,12 @@ def train_morl(
             'std_return_pref': _safe_std(all_returns_pref),
             'std_return_health': _safe_std(all_returns_health),
             'std_return_div': _safe_std(all_returns_div),
+            'mean_advantage_pref': _safe_mean(all_advantages_pref),
+            'mean_advantage_health': _safe_mean(all_advantages_health),
+            'mean_advantage_div': _safe_mean(all_advantages_div),
+            'std_advantage_pref': _safe_std(all_advantages_pref),
+            'std_advantage_health': _safe_std(all_advantages_health),
+            'std_advantage_div': _safe_std(all_advantages_div),
             'mean_episode_length': _safe_mean(episode_lengths),
             'mean_reward_pref': _safe_mean(reward_pref),
             'mean_reward_health': _safe_mean(reward_health),
