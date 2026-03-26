@@ -175,6 +175,7 @@ def train_morl(
     batch_size: int = 64,
     lr: float = 1e-3,
     gamma: float = 1.0,
+    entropy_coef: float = 0.01,
     checkpoint_dir: str = '.',
     checkpoint_every: int = 10,
     log_every: int = 10,
@@ -203,6 +204,7 @@ def train_morl(
     batch_size : users per gradient step.
     lr : Adam learning rate.
     gamma : discount factor used to build reward-to-go returns.
+    entropy_coef : coefficient for normalized entropy regularization.
     checkpoint_dir : directory to save policy checkpoints.
     checkpoint_every : save every N epochs.
     device : compute device.
@@ -267,7 +269,7 @@ def train_morl(
     stats: List[Dict[str, Any]] = []
 
     logger.info(
-        'Starting MORL training: epochs=%d batch_size=%d K=%d M=%d lr=%.4g hidden_dim=%d gamma=%.4f',
+        'Starting MORL training: epochs=%d batch_size=%d K=%d M=%d lr=%.4g hidden_dim=%d gamma=%.4f entropy_coef=%.4g',
         num_epochs,
         batch_size,
         K,
@@ -275,6 +277,7 @@ def train_morl(
         lr,
         hidden_dim,
         gamma,
+        entropy_coef,
     )
 
     final_epoch = 0
@@ -297,6 +300,7 @@ def train_morl(
         episode_lengths: List[float] = []
         entropies: List[float] = []
         normalized_entropies: List[float] = []
+        entropy_bonus_terms: List[torch.Tensor] = []
         selected_positions: List[int] = []
         selected_probs: List[float] = []
         max_probs: List[float] = []
@@ -309,6 +313,8 @@ def train_morl(
                 env, policy, user_id, dev
             )
             all_log_probs.append(log_probs)
+            if entropy_terms:
+                entropy_bonus_terms.append(torch.stack(entropy_terms).mean())
 
             raw_returns_pref = _discounted_returns(rewards['pref'], gamma)
             raw_returns_health = _discounted_returns(rewards['health'], gamma)
@@ -368,7 +374,17 @@ def train_morl(
             grads['div'],
         ])
         alpha_pref, alpha_health, alpha_div = [float(value) for value in alpha_array]
-        policy_loss = alpha_pref * loss_pref + alpha_health * loss_health + alpha_div * loss_div
+        entropy_bonus = (
+            torch.stack(entropy_bonus_terms).mean()
+            if entropy_bonus_terms
+            else loss_pref.new_zeros(())
+        )
+        policy_loss = (
+            alpha_pref * loss_pref
+            + alpha_health * loss_health
+            + alpha_div * loss_div
+            - entropy_coef * entropy_bonus
+        )
 
         optimizer.zero_grad()
         policy_loss.backward()
@@ -399,6 +415,8 @@ def train_morl(
             'std_advantage_pref': _safe_std(all_advantages_pref),
             'std_advantage_health': _safe_std(all_advantages_health),
             'std_advantage_div': _safe_std(all_advantages_div),
+            'entropy_bonus': float(entropy_bonus.detach().cpu()),
+            'entropy_coef': float(entropy_coef),
             'mean_episode_length': _safe_mean(episode_lengths),
             'mean_reward_pref': _safe_mean(reward_pref),
             'mean_reward_health': _safe_mean(reward_health),

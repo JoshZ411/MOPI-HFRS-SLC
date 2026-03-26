@@ -56,6 +56,8 @@ def main():
     parser.add_argument('--hidden_dim', type=int, default=256)
     parser.add_argument('--gamma', type=float, default=1.0,
                         help='Discount factor for per-objective reward-to-go returns.')
+    parser.add_argument('--entropy_coef', type=float, default=0.01,
+                        help='Coefficient for normalized entropy regularization during training.')
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--output_dir', type=str, default='morl_output')
     parser.add_argument('--device', type=str, default='auto',
@@ -189,6 +191,7 @@ def main():
         batch_size=args.batch_size,
         lr=args.lr,
         gamma=args.gamma,
+        entropy_coef=args.entropy_coef,
         checkpoint_dir=args.output_dir,
         log_every=args.log_every,
         metrics_path=metrics_path,
