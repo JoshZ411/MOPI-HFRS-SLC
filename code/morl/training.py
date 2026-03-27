@@ -8,7 +8,7 @@ Only the ConditionalPolicy parameters are updated.
 import logging
 import math
 import os
-from typing import Any, Dict, List, Optional, Sequence, Tuple, cast
+from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple, cast
 
 import torch
 import torch.optim as optim
@@ -243,6 +243,9 @@ def train_morl(
     lr: float = 1e-3,
     gamma: float = 1.0,
     entropy_coef: float = 0.01,
+    pref_negative_samples: int = 10,
+    pref_negative_sampling: Literal['hard', 'random', 'mixed'] = 'mixed',
+    pref_hard_negative_ratio: float = 0.7,
     checkpoint_dir: str = '.',
     checkpoint_every: int = 10,
     log_every: int = 10,
@@ -272,6 +275,12 @@ def train_morl(
     lr : Adam learning rate.
     gamma : discount factor used to build reward-to-go returns.
     entropy_coef : coefficient for normalized entropy regularization.
+    pref_negative_samples : number of sampled unchosen candidates used to
+        form the BPR-style preference reward at each step.
+    pref_negative_sampling : negative sampling strategy for BPR-style
+        preference reward. One of {'hard', 'random', 'mixed'}.
+    pref_hard_negative_ratio : fraction of BPR negatives drawn from the
+        highest-scoring remaining items when using mixed sampling.
     checkpoint_dir : directory to save policy checkpoints.
     checkpoint_every : save every N epochs.
     device : compute device.n
@@ -317,6 +326,9 @@ def train_morl(
         item_tags=item_tags,
         candidate_pools=train_pools,
         K=K,
+        pref_negative_samples=pref_negative_samples,
+        pref_negative_sampling=pref_negative_sampling,
+        pref_hard_negative_ratio=pref_hard_negative_ratio,
         device=dev,
     )
 
@@ -336,7 +348,7 @@ def train_morl(
     stats: List[Dict[str, Any]] = []
 
     logger.info(
-        'Starting MORL training: epochs=%d batch_size=%d K=%d M=%d lr=%.4g hidden_dim=%d gamma=%.4f entropy_coef=%.4g',
+        'Starting MORL training: epochs=%d batch_size=%d K=%d M=%d lr=%.4g hidden_dim=%d gamma=%.4f entropy_coef=%.4g pref_negative_samples=%d pref_negative_sampling=%s pref_hard_negative_ratio=%.2f',
         num_epochs,
         batch_size,
         K,
@@ -345,6 +357,9 @@ def train_morl(
         hidden_dim,
         gamma,
         entropy_coef,
+        pref_negative_samples,
+        pref_negative_sampling,
+        pref_hard_negative_ratio,
     )
 
     final_epoch = 0

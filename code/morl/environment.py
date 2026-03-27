@@ -11,14 +11,15 @@ Action:
     index into the candidate pool (items not yet selected in this episode).
 
 Reward (per step, multi-objective vector):
-    r_pref   = cosine similarity between user and selected item embeddings
+    r_pref   = mean log-sigmoid margin between the selected item and sampled
+               unchosen candidates under the frozen dot-product scorer
     r_health = Jaccard(new_tag_coverage, user_tags)
     r_div    = -mean_cosine_sim(item_emb, selected_embs)   (0 when selecting the first item)
 """
 
 import torch
 import torch.nn.functional as F
-from typing import List, Optional, Tuple
+from typing import List, Literal, Optional, Tuple
 
 
 class RecommendationEnv:
@@ -38,6 +39,14 @@ class RecommendationEnv:
         Pre-computed top-M item indices per user.
     K : int
         Episode length (recommendation list length).
+    pref_negative_samples : int
+        Number of unchosen candidates sampled to form the BPR-style
+        preference reward at each step.
+    pref_negative_sampling : {'hard', 'random', 'mixed'}
+        Strategy used to choose unselected comparison items.
+    pref_hard_negative_ratio : float
+        Fraction of comparison items drawn from the highest-scoring unchosen
+        candidates when ``pref_negative_sampling='mixed'``.
     device : torch.device
     """
 
@@ -49,6 +58,9 @@ class RecommendationEnv:
         item_tags: torch.Tensor,
         candidate_pools: dict,
         K: int = 20,
+        pref_negative_samples: int = 10,
+        pref_negative_sampling: Literal['hard', 'random', 'mixed'] = 'mixed',
+        pref_hard_negative_ratio: float = 0.7,
         device: Optional[torch.device] = None,
     ):
         self.device = device or torch.device('cpu')
@@ -58,21 +70,22 @@ class RecommendationEnv:
         self.item_tags = item_tags.float().to(self.device)
         self.candidate_pools = candidate_pools
         self.K = K
+        self.pref_negative_samples = max(1, pref_negative_samples)
+        self.pref_negative_sampling = pref_negative_sampling
+        self.pref_hard_negative_ratio = min(max(pref_hard_negative_ratio, 0.0), 1.0)
 
         self.d = user_emb.size(1)
         self.tag_dim = user_tags.size(1)
         self.state_dim = 2 * self.d + self.tag_dim + 1
 
-        # Normalise user embeddings (used for stable dot-product rewards)
-        self._user_emb_norm = F.normalize(self.user_emb, dim=1)
         self._item_emb_norm = F.normalize(self.item_emb, dim=1)
 
         # Episode state (reset per user)
-        self._user_id: Optional[int] = None
+        self._user_id: int = -1
         self._selected: List[int] = []
         self._remaining: List[int] = []
-        self._agg_emb: Optional[torch.Tensor] = None
-        self._tag_coverage: Optional[torch.Tensor] = None
+        self._agg_emb = torch.zeros(self.d, device=self.device)
+        self._tag_coverage = torch.zeros(self.tag_dim, device=self.device)
         self._t: int = 0
 
     # ------------------------------------------------------------------
@@ -115,15 +128,20 @@ class RecommendationEnv:
         self._selected.append(item_idx)
 
         item_vec = self.item_emb[item_idx]
-        item_vec_norm = self._item_emb_norm[item_idx]
-
-        # ---- r_pref: cosine similarity between user and selected item ----
-        user_vec_norm = self._user_emb_norm[self._user_id]
-        r_pref = torch.dot(user_vec_norm, item_vec_norm).item()
+        # ---- r_pref: sampled BPR reward using the frozen dot-product scorer ----
+        user_vec = self.user_emb[self._user_id]
+        if self._remaining:
+            negative_indices = self._sample_negative_indices(user_vec)
+            chosen_score = torch.dot(user_vec, item_vec)
+            negative_scores = self.item_emb[negative_indices] @ user_vec
+            r_pref = F.logsigmoid(chosen_score - negative_scores).mean().item()
+        else:
+            r_pref = 0.0
 
         # ---- update aggregated embedding (incremental mean) ----
         t = len(self._selected)
-        self._agg_emb = (self._agg_emb * (t - 1) + item_vec) / t
+        agg_emb = self._agg_emb
+        self._agg_emb = (agg_emb * (t - 1) + item_vec) / t
 
         # ---- r_div: negative mean cosine-sim with previously selected items ----
         if len(self._selected) > 1:
@@ -135,8 +153,8 @@ class RecommendationEnv:
 
         # ---- update tag coverage and compute r_health ----
         new_item_tags = self.item_tags[item_idx]
-        old_coverage = self._tag_coverage.clone()
-        self._tag_coverage = torch.clamp(self._tag_coverage + new_item_tags, max=1.0)
+        tag_coverage = self._tag_coverage
+        self._tag_coverage = torch.clamp(tag_coverage + new_item_tags, max=1.0)
 
         user_tag_vec = self.user_tags[self._user_id]
         intersection = torch.sum(torch.min(self._tag_coverage, user_tag_vec))
@@ -163,10 +181,47 @@ class RecommendationEnv:
     # Internals
     # ------------------------------------------------------------------
 
+    def _sample_negative_indices(self, user_vec: torch.Tensor) -> torch.Tensor:
+        remaining_count = len(self._remaining)
+        negative_count = min(self.pref_negative_samples, remaining_count)
+        remaining_indices = torch.tensor(self._remaining, dtype=torch.long, device=self.device)
+
+        if self.pref_negative_sampling == 'random' or negative_count >= remaining_count:
+            sampled_positions = torch.randperm(remaining_count, device=self.device)[:negative_count]
+            return remaining_indices[sampled_positions]
+
+        remaining_scores = self.item_emb[remaining_indices] @ user_vec
+        if self.pref_negative_sampling == 'hard':
+            hard_positions = torch.topk(remaining_scores, k=negative_count, largest=True).indices
+            return remaining_indices[hard_positions]
+
+        hard_count = min(
+            negative_count,
+            max(1, int(round(negative_count * self.pref_hard_negative_ratio))),
+        )
+        random_count = negative_count - hard_count
+
+        hard_positions = torch.topk(remaining_scores, k=hard_count, largest=True).indices
+        if random_count <= 0:
+            return remaining_indices[hard_positions]
+
+        chosen_mask = torch.zeros(remaining_count, dtype=torch.bool, device=self.device)
+        chosen_mask[hard_positions] = True
+        random_pool_positions = torch.nonzero(~chosen_mask, as_tuple=False).flatten()
+        if random_pool_positions.numel() == 0:
+            return remaining_indices[hard_positions]
+
+        random_count = min(random_count, int(random_pool_positions.numel()))
+        random_pick_order = torch.randperm(random_pool_positions.numel(), device=self.device)[:random_count]
+        random_positions = random_pool_positions[random_pick_order]
+        return remaining_indices[torch.cat([hard_positions, random_positions], dim=0)]
+
     def _build_state(self) -> torch.Tensor:
         user_vec = self.user_emb[self._user_id]
+        agg_emb = self._agg_emb
+        tag_coverage = self._tag_coverage
         timestep = torch.tensor([self._t / self.K], device=self.device)
-        return torch.cat([user_vec, self._agg_emb, self._tag_coverage, timestep])
+        return torch.cat([user_vec, agg_emb, tag_coverage, timestep])
 
 
 # ------------------------------------------------------------------

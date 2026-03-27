@@ -58,6 +58,12 @@ def main():
                         help='Discount factor for per-objective reward-to-go returns.')
     parser.add_argument('--entropy_coef', type=float, default=0.01,
                         help='Coefficient for normalized entropy regularization during training.')
+    parser.add_argument('--pref_negative_samples', type=int, default=10,
+                        help='Number of sampled unchosen candidates used in the BPR-style preference reward.')
+    parser.add_argument('--pref_negative_sampling', type=str, default='mixed', choices=['hard', 'random', 'mixed'],
+                        help='Strategy used to choose BPR comparison negatives.')
+    parser.add_argument('--pref_hard_negative_ratio', type=float, default=0.7,
+                        help='Fraction of BPR negatives taken from the highest-scoring unchosen items when using mixed sampling.')
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--output_dir', type=str, default='morl_output')
     parser.add_argument('--device', type=str, default='auto',
@@ -227,6 +233,9 @@ def main():
         lr=args.lr,
         gamma=args.gamma,
         entropy_coef=args.entropy_coef,
+        pref_negative_samples=args.pref_negative_samples,
+        pref_negative_sampling=args.pref_negative_sampling,
+        pref_hard_negative_ratio=args.pref_hard_negative_ratio,
         checkpoint_dir=args.output_dir,
         log_every=args.log_every,
         metrics_path=metrics_path,
