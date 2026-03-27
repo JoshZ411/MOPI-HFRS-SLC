@@ -132,6 +132,73 @@ def summarize_candidate_pools(candidate_pools: Dict[int, List[int]], K: int) -> 
     }
 
 
+def measure_candidate_pool_ceiling(
+    user_emb: torch.Tensor,
+    item_emb: torch.Tensor,
+    eval_user_ids: List[int],
+    pos_items_per_user: Dict[int, List[int]],
+    exclude_per_user: Optional[Dict[int, set]] = None,
+    K: int = 20,
+    M: int = 200,
+    device: Optional[torch.device] = None,
+) -> Dict[str, float]:
+    """Measure how much held-out relevance is recoverable from the top-M pool.
+
+    Returns metrics that describe the best-case ceiling before the reranker acts.
+    """
+    dev = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    pools = build_candidate_pools(
+        user_emb, item_emb, M=M,
+        exclude_per_user=exclude_per_user,
+        device=dev,
+    )
+
+    pool_sizes: List[float] = []
+    pool_hits: List[float] = []
+    pool_recall_ceiling: List[float] = []
+    rerank_recall_ceiling: List[float] = []
+    rerank_ndcg_ceiling: List[float] = []
+    hit_users = 0
+    eligible_users = 0
+
+    for user_id in eval_user_ids:
+        ground_truth = set(pos_items_per_user.get(user_id, []))
+        if not ground_truth:
+            continue
+        eligible_users += 1
+
+        pool = pools.get(user_id, [])
+        pool_set = set(pool)
+        hits_in_pool = len(pool_set & ground_truth)
+        if hits_in_pool > 0:
+            hit_users += 1
+
+        pool_sizes.append(float(len(pool)))
+        pool_hits.append(float(hits_in_pool))
+        pool_recall_ceiling.append(hits_in_pool / len(ground_truth))
+        rerank_recall_ceiling.append(min(hits_in_pool, K) / len(ground_truth))
+
+        dcg = 0.0
+        ideal_hits = min(hits_in_pool, K)
+        gt_count = len(ground_truth)
+        for rank in range(1, ideal_hits + 1):
+            dcg += 1.0 / math.log2(rank + 1)
+        idcg = 0.0
+        for rank in range(1, min(gt_count, K) + 1):
+            idcg += 1.0 / math.log2(rank + 1)
+        rerank_ndcg_ceiling.append(dcg / idcg if idcg > 0 else 0.0)
+
+    return {
+        'eligible_users': float(eligible_users),
+        'pool_user_hit_rate': hit_users / eligible_users if eligible_users else 0.0,
+        'pool_size_mean': _safe_mean(pool_sizes),
+        'pool_hits_mean': _safe_mean(pool_hits),
+        'pool_recall_ceiling': _safe_mean(pool_recall_ceiling),
+        'rerank_recall_ceiling_at_k': _safe_mean(rerank_recall_ceiling),
+        'rerank_ndcg_ceiling_at_k': _safe_mean(rerank_ndcg_ceiling),
+    }
+
+
 def _discounted_returns(rewards: torch.Tensor, gamma: float) -> torch.Tensor:
     returns = torch.zeros_like(rewards)
     running = torch.zeros((), dtype=rewards.dtype, device=rewards.device)
@@ -207,7 +274,7 @@ def train_morl(
     entropy_coef : coefficient for normalized entropy regularization.
     checkpoint_dir : directory to save policy checkpoints.
     checkpoint_every : save every N epochs.
-    device : compute device.
+    device : compute device.n
 
     Returns
     -------

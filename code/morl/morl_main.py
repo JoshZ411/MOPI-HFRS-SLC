@@ -8,7 +8,7 @@ import torch
 from sklearn.model_selection import train_test_split
 
 from .logging_utils import WandbTracker, append_jsonl, build_run_config, save_json, setup_logger
-from .training import train_morl, evaluate_morl
+from .training import train_morl, evaluate_morl, measure_candidate_pool_ceiling
 
 
 def get_user_positive_items(edge_index):
@@ -171,6 +171,41 @@ def main():
         len(test_users),
     )
 
+    val_pool_ceiling = measure_candidate_pool_ceiling(
+        user_emb=user_emb,
+        item_emb=item_emb,
+        eval_user_ids=val_users,
+        pos_items_per_user=val_pos,
+        exclude_per_user=exclude_val,
+        K=args.K,
+        M=args.M,
+        device=device,
+    )
+    test_pool_ceiling = measure_candidate_pool_ceiling(
+        user_emb=user_emb,
+        item_emb=item_emb,
+        eval_user_ids=test_users,
+        pos_items_per_user=test_pos,
+        exclude_per_user=exclude_test,
+        K=args.K,
+        M=args.M,
+        device=device,
+    )
+
+    logger.info('=== Candidate Pool Ceiling (validation) ===')
+    for key, value in val_pool_ceiling.items():
+        logger.info('  %s: %.5f', key, value)
+        append_jsonl(eval_path, {'type': 'val_pool_ceiling', 'metric': key, 'value': float(value)})
+
+    logger.info('=== Candidate Pool Ceiling (test) ===')
+    for key, value in test_pool_ceiling.items():
+        logger.info('  %s: %.5f', key, value)
+        append_jsonl(eval_path, {'type': 'test_pool_ceiling', 'metric': key, 'value': float(value)})
+
+    if tracker is not None:
+        tracker.log({f'val_pool/{key}': value for key, value in val_pool_ceiling.items()})
+        tracker.log({f'test_pool/{key}': value for key, value in test_pool_ceiling.items()})
+
     # ------------------------------------------------------------------
     # Phases 3–6: Train MORL policy
     # ------------------------------------------------------------------
@@ -182,7 +217,7 @@ def main():
         item_tags=food_tags,
         train_user_ids=train_users,
         val_user_ids=val_users,
-            exclude_per_user_train=exclude_val,
+        exclude_per_user_train=exclude_val,
         exclude_per_user_val=exclude_val,
         K=args.K,
         M=args.M,
