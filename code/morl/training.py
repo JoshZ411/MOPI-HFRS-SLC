@@ -193,8 +193,8 @@ def train_morl(
     train_user_ids : user indices used for RL training episodes.
     val_user_ids : user indices used for validation (held out from RL training).
     exclude_per_user_train : dict mapping user_id → set of item indices to mask
-        from candidate pools during RL training (optional; if None, full top-M
-        is used without exclusion as per design choice).
+           from candidate pools during RL training so the policy only ranks unseen
+           items for each user.
     exclude_per_user_val : dict mapping user_id → set of item indices to mask
         during validation ranking (training + val positives excluded).
     K : recommendation list length.

@@ -182,7 +182,7 @@ def main():
         item_tags=food_tags,
         train_user_ids=train_users,
         val_user_ids=val_users,
-        exclude_per_user_train=None,   # no exclusion during RL training
+            exclude_per_user_train=exclude_val,
         exclude_per_user_val=exclude_val,
         K=args.K,
         M=args.M,
