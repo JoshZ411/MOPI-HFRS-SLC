@@ -43,6 +43,11 @@ def run_episode(
     entropies: List[float] = []
     normalized_entropies: List[float] = []
     selected_positions: List[int] = []
+    chosen_score_ranks: List[float] = []
+    chosen_score_values: List[float] = []
+    negative_score_means: List[float] = []
+    margin_means: List[float] = []
+    margin_stds: List[float] = []
     selected_probs: List[float] = []
     max_probs: List[float] = []
 
@@ -70,6 +75,12 @@ def run_episode(
         selected_positions.append(action)
         selected_probs.append(info['selected_prob'])
         max_probs.append(info['max_prob'])
+        step_info = env.last_step_info
+        chosen_score_ranks.append(step_info.get('chosen_score_rank_1based', 0.0))
+        chosen_score_values.append(step_info.get('chosen_score', 0.0))
+        negative_score_means.append(step_info.get('negative_score_mean', 0.0))
+        margin_means.append(step_info.get('margin_mean', 0.0))
+        margin_stds.append(step_info.get('margin_std', 0.0))
 
         if done:
             break
@@ -84,6 +95,11 @@ def run_episode(
         'mean_entropy': sum(entropies) / len(entropies) if entropies else 0.0,
         'mean_normalized_entropy': sum(normalized_entropies) / len(normalized_entropies) if normalized_entropies else 0.0,
         'selected_positions': selected_positions,
+        'chosen_score_ranks': chosen_score_ranks,
+        'chosen_score_values': chosen_score_values,
+        'negative_score_means': negative_score_means,
+        'margin_means': margin_means,
+        'margin_stds': margin_stds,
         'mean_selected_prob': sum(selected_probs) / len(selected_probs) if selected_probs else 0.0,
         'mean_max_prob': sum(max_probs) / len(max_probs) if max_probs else 0.0,
     }
@@ -110,6 +126,13 @@ def _grad_norm(policy: ConditionalPolicy) -> float:
         grad_value = param.grad.detach().data.norm(2).item()
         total += grad_value ** 2
     return math.sqrt(total)
+
+
+def _cosine_similarity(vec_a: torch.Tensor, vec_b: torch.Tensor) -> float:
+    denom = vec_a.norm(2) * vec_b.norm(2)
+    if float(denom.item()) <= 1e-12:
+        return 0.0
+    return float(torch.dot(vec_a, vec_b).item() / denom.item())
 
 
 def summarize_candidate_pools(candidate_pools: Dict[int, List[int]], K: int) -> Dict[str, float]:
@@ -384,6 +407,11 @@ def train_morl(
         normalized_entropies: List[float] = []
         entropy_bonus_terms: List[torch.Tensor] = []
         selected_positions: List[int] = []
+        chosen_score_ranks: List[float] = []
+        chosen_score_values: List[float] = []
+        negative_score_means: List[float] = []
+        margin_means: List[float] = []
+        margin_stds: List[float] = []
         selected_probs: List[float] = []
         max_probs: List[float] = []
         loss_pref_terms: List[torch.Tensor] = []
@@ -426,6 +454,11 @@ def train_morl(
             entropies.append(episode_diag['mean_entropy'])
             normalized_entropies.append(episode_diag['mean_normalized_entropy'])
             selected_positions.extend(episode_diag['selected_positions'])
+            chosen_score_ranks.extend(episode_diag['chosen_score_ranks'])
+            chosen_score_values.extend(episode_diag['chosen_score_values'])
+            negative_score_means.extend(episode_diag['negative_score_means'])
+            margin_means.extend(episode_diag['margin_means'])
+            margin_stds.extend(episode_diag['margin_stds'])
             selected_probs.append(episode_diag['mean_selected_prob'])
             max_probs.append(episode_diag['mean_max_prob'])
 
@@ -444,6 +477,10 @@ def train_morl(
             task_loss.backward(retain_graph=True)
             grads[task_name] = [_collect_flat_gradients(policy)]
             policy.zero_grad()
+
+        pref_health_grad_cosine = _cosine_similarity(grads['pref'][0], grads['health'][0])
+        pref_div_grad_cosine = _cosine_similarity(grads['pref'][0], grads['div'][0])
+        health_div_grad_cosine = _cosine_similarity(grads['health'][0], grads['div'][0])
 
         gn = gradient_normalizers(grads, losses, 'l2')
         for task_name in grads:
@@ -506,13 +543,34 @@ def train_morl(
             'std_reward_pref': _safe_std(reward_pref),
             'std_reward_health': _safe_std(reward_health),
             'std_reward_div': _safe_std(reward_div),
+            'pref_margin_mean': _safe_mean(margin_means),
+            'pref_margin_std': _safe_mean(margin_stds),
+            'mean_chosen_score': _safe_mean(chosen_score_values),
+            'mean_negative_score': _safe_mean(negative_score_means),
             'mean_entropy': _safe_mean(entropies),
             'mean_normalized_entropy': _safe_mean(normalized_entropies),
             'mean_selected_prob': _safe_mean(selected_probs),
             'mean_max_prob': _safe_mean(max_probs),
             'mean_action_position': _safe_mean([float(position) for position in selected_positions]),
             'std_action_position': _safe_std([float(position) for position in selected_positions]),
+            'mean_frozen_score_rank': _safe_mean(chosen_score_ranks),
+            'std_frozen_score_rank': _safe_std(chosen_score_ranks),
+            'top10_action_fraction': (
+                sum(rank <= 10.0 for rank in chosen_score_ranks) / len(chosen_score_ranks)
+                if chosen_score_ranks else 0.0
+            ),
+            'top50_action_fraction': (
+                sum(rank <= 50.0 for rank in chosen_score_ranks) / len(chosen_score_ranks)
+                if chosen_score_ranks else 0.0
+            ),
+            'top100_action_fraction': (
+                sum(rank <= 100.0 for rank in chosen_score_ranks) / len(chosen_score_ranks)
+                if chosen_score_ranks else 0.0
+            ),
             'grad_norm': grad_norm,
+            'grad_cosine_pref_health': pref_health_grad_cosine,
+            'grad_cosine_pref_div': pref_div_grad_cosine,
+            'grad_cosine_health_div': health_div_grad_cosine,
             'alpha_pref_mean': alpha_pref,
             'alpha_health_mean': alpha_health,
             'alpha_div_mean': alpha_div,
@@ -539,6 +597,7 @@ def train_morl(
             logger.info(
                 'Epoch %4d | loss=%.4f [pref=%.4f health=%.4f div=%.4f] | '
                 'return[p/h/d]=%.4f/%.4f/%.4f | reward[p/h/d]=%.4f/%.4f/%.4f | '
+                'margin=%.4f±%.4f rank=%.2f top10=%.3f | '
                 'entropy=%.4f entropy_norm=%.4f grad=%.4f alpha[p/h/d]=%.3f/%.3f/%.3f',
                 epoch,
                 epoch_stats['policy_loss'],
@@ -551,6 +610,10 @@ def train_morl(
                 epoch_stats['mean_reward_pref'],
                 epoch_stats['mean_reward_health'],
                 epoch_stats['mean_reward_div'],
+                epoch_stats['pref_margin_mean'],
+                epoch_stats['pref_margin_std'],
+                epoch_stats['mean_frozen_score_rank'],
+                epoch_stats['top10_action_fraction'],
                 epoch_stats['mean_entropy'],
                 epoch_stats['mean_normalized_entropy'],
                 epoch_stats['grad_norm'],

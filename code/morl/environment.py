@@ -19,7 +19,7 @@ Reward (per step, multi-objective vector):
 
 import torch
 import torch.nn.functional as F
-from typing import List, Literal, Optional, Tuple
+from typing import Dict, List, Literal, Optional, Tuple
 
 
 class RecommendationEnv:
@@ -87,6 +87,7 @@ class RecommendationEnv:
         self._agg_emb = torch.zeros(self.d, device=self.device)
         self._tag_coverage = torch.zeros(self.tag_dim, device=self.device)
         self._t: int = 0
+        self.last_step_info: Dict[str, float] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -105,6 +106,7 @@ class RecommendationEnv:
         self._agg_emb = torch.zeros(self.d, device=self.device)
         self._tag_coverage = torch.zeros(self.tag_dim, device=self.device)
         self._t = 0
+        self.last_step_info = {}
         return self._build_state()
 
     def step(self, action: int) -> Tuple[torch.Tensor, torch.Tensor, bool]:
@@ -124,19 +126,32 @@ class RecommendationEnv:
         assert 0 <= action < len(self._remaining), \
             f"action {action} out of range (remaining={len(self._remaining)})"
 
+        user_vec = self.user_emb[self._user_id]
+        remaining_indices_before = torch.tensor(self._remaining, dtype=torch.long, device=self.device)
+        remaining_scores_before = self.item_emb[remaining_indices_before] @ user_vec
+        chosen_score = remaining_scores_before[action]
+        chosen_rank_1based = int((remaining_scores_before > chosen_score).sum().item()) + 1
+
         item_idx = self._remaining.pop(action)
         self._selected.append(item_idx)
 
         item_vec = self.item_emb[item_idx]
         # ---- r_pref: sampled BPR reward using the frozen dot-product scorer ----
-        user_vec = self.user_emb[self._user_id]
         if self._remaining:
             negative_indices = self._sample_negative_indices(user_vec)
-            chosen_score = torch.dot(user_vec, item_vec)
             negative_scores = self.item_emb[negative_indices] @ user_vec
-            r_pref = F.logsigmoid(chosen_score - negative_scores).mean().item()
+            margins = chosen_score - negative_scores
+            r_pref = F.logsigmoid(margins).mean().item()
+            negative_score_mean = negative_scores.mean().item()
+            negative_score_std = negative_scores.std(unbiased=False).item() if negative_scores.numel() > 1 else 0.0
+            margin_mean = margins.mean().item()
+            margin_std = margins.std(unbiased=False).item() if margins.numel() > 1 else 0.0
         else:
             r_pref = 0.0
+            negative_score_mean = 0.0
+            negative_score_std = 0.0
+            margin_mean = 0.0
+            margin_std = 0.0
 
         # ---- update aggregated embedding (incremental mean) ----
         t = len(self._selected)
@@ -164,6 +179,14 @@ class RecommendationEnv:
         self._t += 1
         done = (self._t >= self.K) or (len(self._remaining) == 0)
         reward = torch.tensor([r_pref, r_health, r_div], dtype=torch.float32, device=self.device)
+        self.last_step_info = {
+            'chosen_score': chosen_score.item(),
+            'negative_score_mean': negative_score_mean,
+            'negative_score_std': negative_score_std,
+            'margin_mean': margin_mean,
+            'margin_std': margin_std,
+            'chosen_score_rank_1based': float(chosen_rank_1based),
+        }
 
         return self._build_state(), reward, done
 
