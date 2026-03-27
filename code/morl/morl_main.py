@@ -58,6 +58,8 @@ def main():
                         help='Discount factor for per-objective reward-to-go returns.')
     parser.add_argument('--entropy_coef', type=float, default=0.01,
                         help='Coefficient for normalized entropy regularization during training.')
+    parser.add_argument('--disable_diversity_reward', action='store_true',
+                        help='Exclude the diversity objective from MGDA while still logging diversity metrics.')
     parser.add_argument('--pref_negative_samples', type=int, default=10,
                         help='Number of sampled unchosen candidates used in the BPR-style preference reward.')
     parser.add_argument('--pref_negative_sampling', type=str, default='mixed', choices=['hard', 'random', 'mixed'],
@@ -233,6 +235,7 @@ def main():
         lr=args.lr,
         gamma=args.gamma,
         entropy_coef=args.entropy_coef,
+        use_diversity_reward=not args.disable_diversity_reward,
         pref_negative_samples=args.pref_negative_samples,
         pref_negative_sampling=args.pref_negative_sampling,
         pref_hard_negative_ratio=args.pref_hard_negative_ratio,

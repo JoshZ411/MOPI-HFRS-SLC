@@ -266,6 +266,7 @@ def train_morl(
     lr: float = 1e-3,
     gamma: float = 1.0,
     entropy_coef: float = 0.01,
+    use_diversity_reward: bool = True,
     pref_negative_samples: int = 10,
     pref_negative_sampling: Literal['hard', 'random', 'mixed'] = 'mixed',
     pref_hard_negative_ratio: float = 0.7,
@@ -298,6 +299,8 @@ def train_morl(
     lr : Adam learning rate.
     gamma : discount factor used to build reward-to-go returns.
     entropy_coef : coefficient for normalized entropy regularization.
+    use_diversity_reward : whether to include the diversity objective in
+        MGDA aggregation. Diversity metrics are still logged either way.
     pref_negative_samples : number of sampled unchosen candidates used to
         form the BPR-style preference reward at each step.
     pref_negative_sampling : negative sampling strategy for BPR-style
@@ -371,7 +374,7 @@ def train_morl(
     stats: List[Dict[str, Any]] = []
 
     logger.info(
-        'Starting MORL training: epochs=%d batch_size=%d K=%d M=%d lr=%.4g hidden_dim=%d gamma=%.4f entropy_coef=%.4g pref_negative_samples=%d pref_negative_sampling=%s pref_hard_negative_ratio=%.2f',
+        'Starting MORL training: epochs=%d batch_size=%d K=%d M=%d lr=%.4g hidden_dim=%d gamma=%.4f entropy_coef=%.4g use_diversity_reward=%s pref_negative_samples=%d pref_negative_sampling=%s pref_hard_negative_ratio=%.2f',
         num_epochs,
         batch_size,
         K,
@@ -380,6 +383,7 @@ def train_morl(
         hidden_dim,
         gamma,
         entropy_coef,
+        use_diversity_reward,
         pref_negative_samples,
         pref_negative_sampling,
         pref_hard_negative_ratio,
@@ -471,28 +475,34 @@ def train_morl(
             'health': loss_health,
             'div': loss_div,
         }
-        grads: Dict[str, List[torch.Tensor]] = {}
+        all_grads: Dict[str, List[torch.Tensor]] = {}
         optimizer.zero_grad()
         for task_name, task_loss in losses.items():
             task_loss.backward(retain_graph=True)
-            grads[task_name] = [_collect_flat_gradients(policy)]
+            all_grads[task_name] = [_collect_flat_gradients(policy)]
             policy.zero_grad()
 
-        pref_health_grad_cosine = _cosine_similarity(grads['pref'][0], grads['health'][0])
-        pref_div_grad_cosine = _cosine_similarity(grads['pref'][0], grads['div'][0])
-        health_div_grad_cosine = _cosine_similarity(grads['health'][0], grads['div'][0])
+        pref_health_grad_cosine = _cosine_similarity(all_grads['pref'][0], all_grads['health'][0])
+        pref_div_grad_cosine = _cosine_similarity(all_grads['pref'][0], all_grads['div'][0])
+        health_div_grad_cosine = _cosine_similarity(all_grads['health'][0], all_grads['div'][0])
 
-        gn = gradient_normalizers(grads, losses, 'l2')
+        active_tasks = ['pref', 'health']
+        if use_diversity_reward:
+            active_tasks.append('div')
+
+        grads = {task_name: all_grads[task_name] for task_name in active_tasks}
+        active_losses = {task_name: losses[task_name] for task_name in active_tasks}
+
+        gn = gradient_normalizers(grads, active_losses, 'l2')
         for task_name in grads:
             grads[task_name][0] = grads[task_name][0] / gn[task_name].to(grads[task_name][0].device)
 
         solver = getattr(MinNormSolver, 'find_min_norm_element_FW')
-        alpha_array, _ = solver([
-            grads['pref'],
-            grads['health'],
-            grads['div'],
-        ])
-        alpha_pref, alpha_health, alpha_div = [float(value) for value in alpha_array]
+        alpha_array, _ = solver([grads[task_name] for task_name in active_tasks])
+        alpha_by_task = {task_name: float(alpha_array[idx]) for idx, task_name in enumerate(active_tasks)}
+        alpha_pref = alpha_by_task.get('pref', 0.0)
+        alpha_health = alpha_by_task.get('health', 0.0)
+        alpha_div = alpha_by_task.get('div', 0.0)
         entropy_bonus = (
             torch.stack(entropy_bonus_terms).mean()
             if entropy_bonus_terms
@@ -536,6 +546,7 @@ def train_morl(
             'std_advantage_div': _safe_std(all_advantages_div),
             'entropy_bonus': float(entropy_bonus.detach().cpu()),
             'entropy_coef': float(entropy_coef),
+            'use_diversity_reward': float(1.0 if use_diversity_reward else 0.0),
             'mean_episode_length': _safe_mean(episode_lengths),
             'mean_reward_pref': _safe_mean(reward_pref),
             'mean_reward_health': _safe_mean(reward_health),
