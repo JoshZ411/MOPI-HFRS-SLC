@@ -55,17 +55,13 @@ def main():
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--hidden_dim', type=int, default=256)
     parser.add_argument('--gamma', type=float, default=1.0,
-                        help='Discount factor for per-objective reward-to-go returns.')
+                        help='Discount factor for reward-to-go returns.')
     parser.add_argument('--entropy_coef', type=float, default=0.01,
-                        help='Coefficient for normalized entropy regularization during training.')
-    parser.add_argument('--disable_diversity_reward', action='store_true',
-                        help='Exclude the diversity objective from MGDA while still logging diversity metrics.')
-    parser.add_argument('--pref_negative_samples', type=int, default=10,
-                        help='Number of sampled unchosen candidates used in the BPR-style preference reward.')
-    parser.add_argument('--pref_negative_sampling', type=str, default='mixed', choices=['hard', 'random', 'mixed'],
-                        help='Strategy used to choose BPR comparison negatives.')
-    parser.add_argument('--pref_hard_negative_ratio', type=float, default=0.7,
-                        help='Fraction of BPR negatives taken from the highest-scoring unchosen items when using mixed sampling.')
+                        help='Coefficient for normalised entropy regularisation during training.')
+    parser.add_argument('--beta', type=float, default=0.5,
+                        help='Weight on the marginal health reward relative to the sparse relevance hit (r = r_rel + beta * r_health).')
+    parser.add_argument('--ema_alpha', type=float, default=0.05,
+                        help='Smoothing factor for the cross-episode EMA return baseline.')
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--output_dir', type=str, default='morl_output')
     parser.add_argument('--device', type=str, default='auto',
@@ -225,6 +221,7 @@ def main():
         item_tags=food_tags,
         train_user_ids=train_users,
         val_user_ids=val_users,
+        val_pos_items={u: set(items) for u, items in val_pos.items()},
         exclude_per_user_train=exclude_val,
         exclude_per_user_val=exclude_val,
         K=args.K,
@@ -234,11 +231,9 @@ def main():
         batch_size=args.batch_size,
         lr=args.lr,
         gamma=args.gamma,
+        beta=args.beta,
         entropy_coef=args.entropy_coef,
-        use_diversity_reward=not args.disable_diversity_reward,
-        pref_negative_samples=args.pref_negative_samples,
-        pref_negative_sampling=args.pref_negative_sampling,
-        pref_hard_negative_ratio=args.pref_hard_negative_ratio,
+        ema_alpha=args.ema_alpha,
         checkpoint_dir=args.output_dir,
         log_every=args.log_every,
         metrics_path=metrics_path,

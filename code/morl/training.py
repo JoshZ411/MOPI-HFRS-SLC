@@ -1,5 +1,14 @@
 """
-MORL training loop using objective-wise REINFORCE with MGDA aggregation.
+MORL training loop: scalarized REINFORCE with a cross-episode EMA baseline.
+
+Reward formulation (Option 1 — val-positive sparse binary):
+    r_rel    = 1 if selected item is in val_pos_items[user], else 0.
+    r_health = marginal Jaccard gain: Jaccard(coverage_t) - Jaccard(coverage_{t-1}).
+    combined = r_rel + beta * r_health   (single scalar per step, fixed beta)
+
+Baseline: exponential moving average of per-episode returns, updated across
+the entire training run.  Replaces within-episode return normalisation to
+preserve cross-episode signal (critical when r_rel is sparse).
 
 No gradients flow into the frozen GNN embeddings.
 Only the ConditionalPolicy parameters are updated.
@@ -8,7 +17,7 @@ Only the ConditionalPolicy parameters are updated.
 import logging
 import math
 import os
-from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple, cast
+from typing import Any, Dict, List, Literal, Optional, Sequence, Set, Tuple, cast
 
 import torch
 import torch.optim as optim
@@ -16,7 +25,6 @@ import torch.optim as optim
 from .environment import RecommendationEnv, build_candidate_pools
 from .logging_utils import append_jsonl
 from .policy import ConditionalPolicy
-from min_norm_solvers import MinNormSolver, gradient_normalizers
 
 
 def run_episode(
@@ -24,32 +32,30 @@ def run_episode(
     policy: ConditionalPolicy,
     user_id: int,
     device: torch.device,
+    beta: float = 0.5,
 ):
     """Roll out one K-step episode for a single user.
 
     Returns
     -------
-    log_probs : List[torch.Tensor]   per-step log π(a_t | s_t, w)
-    rewards   : Dict[str, torch.Tensor] objective-wise reward sequences
-    entropy_terms : List[torch.Tensor] per-step normalized entropy values
-    diagnostics : dict
+    log_probs     : List[torch.Tensor]  per-step log π(a_t | s_t)
+    combined_rewards : torch.Tensor    shape (T,)  r_rel + beta * r_health per step
+    entropy_terms : List[torch.Tensor] per-step normalised entropy values
+    diagnostics   : dict
     """
     state = env.reset(user_id).to(device)
     log_probs: List[torch.Tensor] = []
-    reward_pref: List[torch.Tensor] = []
+    reward_rel: List[torch.Tensor] = []
     reward_health: List[torch.Tensor] = []
-    reward_div: List[torch.Tensor] = []
     entropy_terms: List[torch.Tensor] = []
     entropies: List[float] = []
     normalized_entropies: List[float] = []
     selected_positions: List[int] = []
     chosen_score_ranks: List[float] = []
     chosen_score_values: List[float] = []
-    negative_score_means: List[float] = []
-    margin_means: List[float] = []
-    margin_stds: List[float] = []
     selected_probs: List[float] = []
     max_probs: List[float] = []
+    rel_hits: int = 0
 
     while True:
         remaining = env.remaining
@@ -65,10 +71,12 @@ def run_episode(
         state, reward, done = env.step(action)
         state = state.to(device)
 
+        r_rel = reward[0].to(device)
+        r_health = reward[1].to(device)
+
         log_probs.append(log_prob)
-        reward_pref.append(reward[0].to(device))
-        reward_health.append(reward[1].to(device))
-        reward_div.append(reward[2].to(device))
+        reward_rel.append(r_rel)
+        reward_health.append(r_health)
         entropy_terms.append(normalized_entropy)
         entropies.append(info['entropy'])
         normalized_entropies.append(info['normalized_entropy'])
@@ -78,32 +86,31 @@ def run_episode(
         step_info = env.last_step_info
         chosen_score_ranks.append(step_info.get('chosen_score_rank_1based', 0.0))
         chosen_score_values.append(step_info.get('chosen_score', 0.0))
-        negative_score_means.append(step_info.get('negative_score_mean', 0.0))
-        margin_means.append(step_info.get('margin_mean', 0.0))
-        margin_stds.append(step_info.get('margin_std', 0.0))
+        if r_rel.item() > 0.5:
+            rel_hits += 1
 
         if done:
             break
 
-    rewards = {
-        'pref': torch.stack(reward_pref),
-        'health': torch.stack(reward_health),
-        'div': torch.stack(reward_div),
-    }
+    rel_tensor = torch.stack(reward_rel)
+    health_tensor = torch.stack(reward_health)
+    combined_rewards = rel_tensor + beta * health_tensor
+
     diagnostics = {
-        'episode_length': len(reward_pref),
+        'episode_length': len(log_probs),
         'mean_entropy': sum(entropies) / len(entropies) if entropies else 0.0,
         'mean_normalized_entropy': sum(normalized_entropies) / len(normalized_entropies) if normalized_entropies else 0.0,
         'selected_positions': selected_positions,
         'chosen_score_ranks': chosen_score_ranks,
         'chosen_score_values': chosen_score_values,
-        'negative_score_means': negative_score_means,
-        'margin_means': margin_means,
-        'margin_stds': margin_stds,
         'mean_selected_prob': sum(selected_probs) / len(selected_probs) if selected_probs else 0.0,
         'mean_max_prob': sum(max_probs) / len(max_probs) if max_probs else 0.0,
+        'rel_hits': float(rel_hits),
+        'mean_reward_rel': float(rel_tensor.mean().item()),
+        'mean_reward_health': float(health_tensor.mean().item()),
+        'episode_return': float(combined_rewards.sum().item()),
     }
-    return log_probs, rewards, entropy_terms, diagnostics
+    return log_probs, combined_rewards, entropy_terms, diagnostics
 
 
 def _safe_mean(values: Sequence[float]) -> float:
@@ -256,6 +263,7 @@ def train_morl(
     item_tags: torch.Tensor,
     train_user_ids: List[int],
     val_user_ids: List[int],
+    val_pos_items: Optional[Dict[int, Set[int]]] = None,
     exclude_per_user_train: Optional[Dict[int, set]] = None,
     exclude_per_user_val: Optional[Dict[int, set]] = None,
     K: int = 20,
@@ -265,11 +273,9 @@ def train_morl(
     batch_size: int = 64,
     lr: float = 1e-3,
     gamma: float = 1.0,
+    beta: float = 0.5,
     entropy_coef: float = 0.01,
-    use_diversity_reward: bool = True,
-    pref_negative_samples: int = 10,
-    pref_negative_sampling: Literal['hard', 'random', 'mixed'] = 'mixed',
-    pref_hard_negative_ratio: float = 0.7,
+    ema_alpha: float = 0.05,
     checkpoint_dir: str = '.',
     checkpoint_every: int = 10,
     log_every: int = 10,
@@ -278,7 +284,7 @@ def train_morl(
     tracker: Optional[Any] = None,
     device: Optional[torch.device] = None,
 ) -> ConditionalPolicy:
-    """Train the MORL conditional policy.
+    """Train the MORL conditional policy (Option 1 — val-positive sparse binary reward).
 
     Parameters
     ----------
@@ -286,30 +292,25 @@ def train_morl(
     user_tags, item_tags : binary health-tag tensors.
     train_user_ids : user indices used for RL training episodes.
     val_user_ids : user indices used for validation (held out from RL training).
-    exclude_per_user_train : dict mapping user_id → set of item indices to mask
-           from candidate pools during RL training so the policy only ranks unseen
-           items for each user.
-    exclude_per_user_val : dict mapping user_id → set of item indices to mask
-        during validation ranking (training + val positives excluded).
+    val_pos_items : dict mapping user_id → set of val-split positive item indices.
+        Selecting one of these items in an episode yields r_rel = 1.
+        Should contain val positives only (train positives are already excluded
+        from the candidate pools via exclude_per_user_train).
+    exclude_per_user_train : item indices to mask from training candidate pools.
+    exclude_per_user_val : item indices to mask from validation candidate pools
+        (typically train + val positives so the eval pool contains only test items).
     K : recommendation list length.
     M : candidate pool size.
     hidden_dim : policy hidden layer width.
     num_epochs : number of training epochs.
     batch_size : users per gradient step.
     lr : Adam learning rate.
-    gamma : discount factor used to build reward-to-go returns.
-    entropy_coef : coefficient for normalized entropy regularization.
-    use_diversity_reward : whether to include the diversity objective in
-        MGDA aggregation. Diversity metrics are still logged either way.
-    pref_negative_samples : number of sampled unchosen candidates used to
-        form the BPR-style preference reward at each step.
-    pref_negative_sampling : negative sampling strategy for BPR-style
-        preference reward. One of {'hard', 'random', 'mixed'}.
-    pref_hard_negative_ratio : fraction of BPR negatives drawn from the
-        highest-scoring remaining items when using mixed sampling.
+    gamma : discount factor for reward-to-go.
+    beta : weight on the marginal health reward relative to the sparse relevance hit.
+    entropy_coef : coefficient for normalised entropy regularisation.
+    ema_alpha : smoothing factor for the cross-episode EMA return baseline.
     checkpoint_dir : directory to save policy checkpoints.
     checkpoint_every : save every N epochs.
-    device : compute device.n
 
     Returns
     -------
@@ -318,6 +319,8 @@ def train_morl(
     dev = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     os.makedirs(checkpoint_dir, exist_ok=True)
     logger = logger or logging.getLogger(__name__)
+
+    val_pos: Dict[int, Set[int]] = val_pos_items or {}
 
     # ----- Build candidate pools (fixed for entire RL training) -----
     logger.info('Building candidate pools for MORL training ...')
@@ -344,6 +347,16 @@ def train_morl(
             K,
         )
 
+    # Log how many train users have at least one val positive in their pool
+    users_with_val_positives = sum(
+        1 for u in train_user_ids
+        if u in train_pools and bool(val_pos.get(u, set()) & set(train_pools[u]))
+    )
+    logger.info(
+        'Val-positive coverage: %d / %d train users have ≥1 val positive in their training pool.',
+        users_with_val_positives, len(train_user_ids),
+    )
+
     # ----- Instantiate environment -----
     env = RecommendationEnv(
         user_emb=user_emb,
@@ -352,9 +365,7 @@ def train_morl(
         item_tags=item_tags,
         candidate_pools=train_pools,
         K=K,
-        pref_negative_samples=pref_negative_samples,
-        pref_negative_sampling=pref_negative_sampling,
-        pref_hard_negative_ratio=pref_hard_negative_ratio,
+        val_pos_items=val_pos,
         device=dev,
     )
 
@@ -374,21 +385,13 @@ def train_morl(
     stats: List[Dict[str, Any]] = []
 
     logger.info(
-        'Starting MORL training: epochs=%d batch_size=%d K=%d M=%d lr=%.4g hidden_dim=%d gamma=%.4f entropy_coef=%.4g use_diversity_reward=%s pref_negative_samples=%d pref_negative_sampling=%s pref_hard_negative_ratio=%.2f',
-        num_epochs,
-        batch_size,
-        K,
-        M,
-        lr,
-        hidden_dim,
-        gamma,
-        entropy_coef,
-        use_diversity_reward,
-        pref_negative_samples,
-        pref_negative_sampling,
-        pref_hard_negative_ratio,
+        'Starting MORL training (Option 1): epochs=%d batch_size=%d K=%d M=%d '
+        'lr=%.4g hidden_dim=%d gamma=%.4f beta=%.4g entropy_coef=%.4g ema_alpha=%.4g',
+        num_epochs, batch_size, K, M, lr, hidden_dim, gamma, beta, entropy_coef, ema_alpha,
     )
 
+    # Cross-episode EMA baseline — updated once per episode across the whole run
+    ema_baseline: float = 0.0
     final_epoch = 0
 
     for epoch in range(1, num_epochs + 1):
@@ -398,14 +401,6 @@ def train_morl(
         batch_users = torch.randperm(len(train_user_ids))[:batch_size].tolist()
         batch_users = [train_user_ids[i] for i in batch_users]
 
-        all_log_probs: List[List[torch.Tensor]] = []
-        all_returns_pref: List[float] = []
-        all_returns_health: List[float] = []
-        all_returns_div: List[float] = []
-        all_advantages_pref: List[float] = []
-        all_advantages_health: List[float] = []
-        all_advantages_div: List[float] = []
-        reward_component_means: List[List[float]] = []
         episode_lengths: List[float] = []
         entropies: List[float] = []
         normalized_entropies: List[float] = []
@@ -413,157 +408,81 @@ def train_morl(
         selected_positions: List[int] = []
         chosen_score_ranks: List[float] = []
         chosen_score_values: List[float] = []
-        negative_score_means: List[float] = []
-        margin_means: List[float] = []
-        margin_stds: List[float] = []
         selected_probs: List[float] = []
         max_probs: List[float] = []
-        loss_pref_terms: List[torch.Tensor] = []
-        loss_health_terms: List[torch.Tensor] = []
-        loss_div_terms: List[torch.Tensor] = []
+        episode_returns: List[float] = []
+        episode_advantages: List[float] = []
+        episode_rel_hits: List[float] = []
+        episode_mean_reward_rel: List[float] = []
+        episode_mean_reward_health: List[float] = []
+        policy_loss_terms: List[torch.Tensor] = []
 
         for user_id in batch_users:
-            log_probs, rewards, entropy_terms, episode_diag = run_episode(
-                env, policy, user_id, dev
+            log_probs, combined_rewards, entropy_terms, episode_diag = run_episode(
+                env, policy, user_id, dev, beta=beta,
             )
-            all_log_probs.append(log_probs)
             if entropy_terms:
                 entropy_bonus_terms.append(torch.stack(entropy_terms).mean())
 
-            raw_returns_pref = _discounted_returns(rewards['pref'], gamma)
-            raw_returns_health = _discounted_returns(rewards['health'], gamma)
-            raw_returns_div = _discounted_returns(rewards['div'], gamma)
+            # Reward-to-go under gamma
+            raw_returns = _discounted_returns(combined_rewards, gamma)
 
-            returns_pref = _normalize_returns(raw_returns_pref)
-            returns_health = _normalize_returns(raw_returns_health)
-            returns_div = _normalize_returns(raw_returns_div)
+            # Cross-episode EMA baseline subtraction
+            G0 = float(raw_returns[0].item())
+            advantage_returns = raw_returns - ema_baseline
+            # Update EMA baseline with this episode's total return
+            ema_baseline = (1.0 - ema_alpha) * ema_baseline + ema_alpha * G0
 
             log_prob_tensor = torch.stack(log_probs)
-            loss_pref_terms.append(-(log_prob_tensor * returns_pref.detach()).sum())
-            loss_health_terms.append(-(log_prob_tensor * returns_health.detach()).sum())
-            loss_div_terms.append(-(log_prob_tensor * returns_div.detach()).sum())
+            policy_loss_terms.append(-(log_prob_tensor * advantage_returns.detach()).sum())
 
-            all_returns_pref.append(float(raw_returns_pref[0].detach().cpu()))
-            all_returns_health.append(float(raw_returns_health[0].detach().cpu()))
-            all_returns_div.append(float(raw_returns_div[0].detach().cpu()))
-            all_advantages_pref.append(float(returns_pref.mean().detach().cpu()))
-            all_advantages_health.append(float(returns_health.mean().detach().cpu()))
-            all_advantages_div.append(float(returns_div.mean().detach().cpu()))
-            reward_component_means.append([
-                float(rewards['pref'].mean().detach().cpu()),
-                float(rewards['health'].mean().detach().cpu()),
-                float(rewards['div'].mean().detach().cpu()),
-            ])
+            episode_returns.append(G0)
+            episode_advantages.append(float(advantage_returns.mean().item()))
             episode_lengths.append(float(episode_diag['episode_length']))
             entropies.append(episode_diag['mean_entropy'])
             normalized_entropies.append(episode_diag['mean_normalized_entropy'])
             selected_positions.extend(episode_diag['selected_positions'])
             chosen_score_ranks.extend(episode_diag['chosen_score_ranks'])
             chosen_score_values.extend(episode_diag['chosen_score_values'])
-            negative_score_means.extend(episode_diag['negative_score_means'])
-            margin_means.extend(episode_diag['margin_means'])
-            margin_stds.extend(episode_diag['margin_stds'])
             selected_probs.append(episode_diag['mean_selected_prob'])
             max_probs.append(episode_diag['mean_max_prob'])
+            episode_rel_hits.append(episode_diag['rel_hits'])
+            episode_mean_reward_rel.append(episode_diag['mean_reward_rel'])
+            episode_mean_reward_health.append(episode_diag['mean_reward_health'])
 
-        loss_pref = torch.stack(loss_pref_terms).mean()
-        loss_health = torch.stack(loss_health_terms).mean()
-        loss_div = torch.stack(loss_div_terms).mean()
-
-        losses = {
-            'pref': loss_pref,
-            'health': loss_health,
-            'div': loss_div,
-        }
-        all_grads: Dict[str, List[torch.Tensor]] = {}
-        optimizer.zero_grad()
-        for task_name, task_loss in losses.items():
-            task_loss.backward(retain_graph=True)
-            all_grads[task_name] = [_collect_flat_gradients(policy)]
-            policy.zero_grad()
-
-        pref_health_grad_cosine = _cosine_similarity(all_grads['pref'][0], all_grads['health'][0])
-        pref_div_grad_cosine = _cosine_similarity(all_grads['pref'][0], all_grads['div'][0])
-        health_div_grad_cosine = _cosine_similarity(all_grads['health'][0], all_grads['div'][0])
-
-        active_tasks = ['pref', 'health']
-        if use_diversity_reward:
-            active_tasks.append('div')
-
-        grads = {task_name: all_grads[task_name] for task_name in active_tasks}
-        active_losses = {task_name: losses[task_name] for task_name in active_tasks}
-
-        gn = gradient_normalizers(grads, active_losses, 'l2')
-        for task_name in grads:
-            grads[task_name][0] = grads[task_name][0] / gn[task_name].to(grads[task_name][0].device)
-
-        solver = getattr(MinNormSolver, 'find_min_norm_element_FW')
-        alpha_array, _ = solver([grads[task_name] for task_name in active_tasks])
-        alpha_by_task = {task_name: float(alpha_array[idx]) for idx, task_name in enumerate(active_tasks)}
-        alpha_pref = alpha_by_task.get('pref', 0.0)
-        alpha_health = alpha_by_task.get('health', 0.0)
-        alpha_div = alpha_by_task.get('div', 0.0)
+        policy_loss_raw = torch.stack(policy_loss_terms).mean()
         entropy_bonus = (
             torch.stack(entropy_bonus_terms).mean()
             if entropy_bonus_terms
-            else loss_pref.new_zeros(())
+            else policy_loss_raw.new_zeros(())
         )
-        policy_loss = (
-            alpha_pref * loss_pref
-            + alpha_health * loss_health
-            + alpha_div * loss_div
-            - entropy_coef * entropy_bonus
-        )
+        policy_loss = policy_loss_raw - entropy_coef * entropy_bonus
 
         optimizer.zero_grad()
         policy_loss.backward()
         grad_norm = _grad_norm(policy)
         optimizer.step()
 
-        reward_pref = [reward[0] for reward in reward_component_means]
-        reward_health = [reward[1] for reward in reward_component_means]
-        reward_div = [reward[2] for reward in reward_component_means]
-
         epoch_stats = {
             'epoch': epoch,
             'policy_loss': policy_loss.item(),
-            'loss_pref': loss_pref.item(),
-            'loss_health': loss_health.item(),
-            'loss_div': loss_div.item(),
-            'mean_return': _safe_mean(all_returns_pref + all_returns_health + all_returns_div),
-            'std_return': _safe_std(all_returns_pref + all_returns_health + all_returns_div),
-            'mean_return_pref': _safe_mean(all_returns_pref),
-            'mean_return_health': _safe_mean(all_returns_health),
-            'mean_return_div': _safe_mean(all_returns_div),
-            'std_return_pref': _safe_std(all_returns_pref),
-            'std_return_health': _safe_std(all_returns_health),
-            'std_return_div': _safe_std(all_returns_div),
-            'mean_advantage_pref': _safe_mean(all_advantages_pref),
-            'mean_advantage_health': _safe_mean(all_advantages_health),
-            'mean_advantage_div': _safe_mean(all_advantages_div),
-            'std_advantage_pref': _safe_std(all_advantages_pref),
-            'std_advantage_health': _safe_std(all_advantages_health),
-            'std_advantage_div': _safe_std(all_advantages_div),
+            'ema_baseline': ema_baseline,
+            'beta': beta,
+            'mean_episode_return': _safe_mean(episode_returns),
+            'std_episode_return': _safe_std(episode_returns),
+            'mean_advantage': _safe_mean(episode_advantages),
+            'mean_rel_hits': _safe_mean(episode_rel_hits),
+            'mean_reward_rel': _safe_mean(episode_mean_reward_rel),
+            'mean_reward_health': _safe_mean(episode_mean_reward_health),
             'entropy_bonus': float(entropy_bonus.detach().cpu()),
             'entropy_coef': float(entropy_coef),
-            'use_diversity_reward': float(1.0 if use_diversity_reward else 0.0),
             'mean_episode_length': _safe_mean(episode_lengths),
-            'mean_reward_pref': _safe_mean(reward_pref),
-            'mean_reward_health': _safe_mean(reward_health),
-            'mean_reward_div': _safe_mean(reward_div),
-            'std_reward_pref': _safe_std(reward_pref),
-            'std_reward_health': _safe_std(reward_health),
-            'std_reward_div': _safe_std(reward_div),
-            'pref_margin_mean': _safe_mean(margin_means),
-            'pref_margin_std': _safe_mean(margin_stds),
-            'mean_chosen_score': _safe_mean(chosen_score_values),
-            'mean_negative_score': _safe_mean(negative_score_means),
             'mean_entropy': _safe_mean(entropies),
             'mean_normalized_entropy': _safe_mean(normalized_entropies),
             'mean_selected_prob': _safe_mean(selected_probs),
             'mean_max_prob': _safe_mean(max_probs),
-            'mean_action_position': _safe_mean([float(position) for position in selected_positions]),
-            'std_action_position': _safe_std([float(position) for position in selected_positions]),
+            'mean_action_position': _safe_mean([float(p) for p in selected_positions]),
+            'std_action_position': _safe_std([float(p) for p in selected_positions]),
             'mean_frozen_score_rank': _safe_mean(chosen_score_ranks),
             'std_frozen_score_rank': _safe_std(chosen_score_ranks),
             'top10_action_fraction': (
@@ -574,27 +493,15 @@ def train_morl(
                 sum(rank <= 50.0 for rank in chosen_score_ranks) / len(chosen_score_ranks)
                 if chosen_score_ranks else 0.0
             ),
-            'top100_action_fraction': (
-                sum(rank <= 100.0 for rank in chosen_score_ranks) / len(chosen_score_ranks)
-                if chosen_score_ranks else 0.0
-            ),
             'grad_norm': grad_norm,
-            'grad_cosine_pref_health': pref_health_grad_cosine,
-            'grad_cosine_pref_div': pref_div_grad_cosine,
-            'grad_cosine_health_div': health_div_grad_cosine,
-            'alpha_pref_mean': alpha_pref,
-            'alpha_health_mean': alpha_health,
-            'alpha_div_mean': alpha_div,
         }
 
         if selected_positions:
-            top_positions = {f'action_pos_{idx}_rate': 0.0 for idx in range(min(10, M))}
             total_positions = len(selected_positions)
-            for idx in range(min(10, M)):
-                top_positions[f'action_pos_{idx}_rate'] = (
-                    sum(position == idx for position in selected_positions) / total_positions
-                )
-            epoch_stats.update(top_positions)
+            epoch_stats.update({
+                f'action_pos_{idx}_rate': sum(p == idx for p in selected_positions) / total_positions
+                for idx in range(min(10, M))
+            })
 
         stats.append(epoch_stats)
 
@@ -606,43 +513,29 @@ def train_morl(
 
         if epoch % log_every == 0:
             logger.info(
-                'Epoch %4d | loss=%.4f [pref=%.4f health=%.4f div=%.4f] | '
-                'return[p/h/d]=%.4f/%.4f/%.4f | reward[p/h/d]=%.4f/%.4f/%.4f | '
-                'margin=%.4f±%.4f rank=%.2f top10=%.3f | '
-                'entropy=%.4f entropy_norm=%.4f grad=%.4f alpha[p/h/d]=%.3f/%.3f/%.3f',
+                'Epoch %4d | loss=%.4f | return=%.4f±%.4f adv=%.4f ema_base=%.4f | '
+                'rel_hits=%.2f reward[rel/h]=%.4f/%.4f | '
+                'rank=%.2f top10=%.3f entropy=%.4f entropy_norm=%.4f grad=%.4f',
                 epoch,
                 epoch_stats['policy_loss'],
-                epoch_stats['loss_pref'],
-                epoch_stats['loss_health'],
-                epoch_stats['loss_div'],
-                epoch_stats['mean_return_pref'],
-                epoch_stats['mean_return_health'],
-                epoch_stats['mean_return_div'],
-                epoch_stats['mean_reward_pref'],
+                epoch_stats['mean_episode_return'],
+                epoch_stats['std_episode_return'],
+                epoch_stats['mean_advantage'],
+                epoch_stats['ema_baseline'],
+                epoch_stats['mean_rel_hits'],
+                epoch_stats['mean_reward_rel'],
                 epoch_stats['mean_reward_health'],
-                epoch_stats['mean_reward_div'],
-                epoch_stats['pref_margin_mean'],
-                epoch_stats['pref_margin_std'],
                 epoch_stats['mean_frozen_score_rank'],
                 epoch_stats['top10_action_fraction'],
                 epoch_stats['mean_entropy'],
                 epoch_stats['mean_normalized_entropy'],
                 epoch_stats['grad_norm'],
-                epoch_stats['alpha_pref_mean'],
-                epoch_stats['alpha_health_mean'],
-                epoch_stats['alpha_div_mean'],
             )
 
         if epoch_stats['mean_entropy'] < 0.05:
-            logger.warning('Epoch %d action entropy is very low (%.4f); exploration may have collapsed.', epoch, epoch_stats['mean_entropy'])
+            logger.warning('Epoch %d action entropy very low (%.4f); exploration may have collapsed.', epoch, epoch_stats['mean_entropy'])
         if epoch_stats['mean_normalized_entropy'] < 0.1:
-            logger.warning(
-                'Epoch %d normalized action entropy is very low (%.4f); the policy is becoming too deterministic over the active action set.',
-                epoch,
-                epoch_stats['mean_normalized_entropy'],
-            )
-        if epoch_stats['std_reward_pref'] < 1e-4 and epoch_stats['std_reward_health'] < 1e-4 and epoch_stats['std_reward_div'] < 1e-4:
-            logger.warning('Epoch %d reward variance is nearly zero across the batch.', epoch)
+            logger.warning('Epoch %d normalised action entropy very low (%.4f).', epoch, epoch_stats['mean_normalized_entropy'])
 
         if epoch % checkpoint_every == 0:
             ckpt_path = os.path.join(checkpoint_dir, f'morl_policy_epoch{epoch}.pt')
