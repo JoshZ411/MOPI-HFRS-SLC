@@ -2,25 +2,19 @@
 Deterministic K-step MDP environment for sequential food-list construction.
 
 State:
-    s_t = concat(user_emb,          # d-dim frozen user embedding
-                 agg_emb,           # d-dim mean of items selected so far (zeros at t=0)
-                 tag_coverage,      # tag_dim binary union of health tags selected so far
-                 [t / K])           # scalar normalised timestep
+    s_t = concat(user_emb, agg_emb, tag_coverage, [t / K])
 
 Action:
     index into the candidate pool (items not yet selected in this episode).
 
 Reward (2-component scalar, summed in training with a fixed beta weight):
     r_rel    = 1 if the selected item is in val_pos_items[user], else 0.
-               Sparse but non-circular: completely independent of the frozen GNN scorer.
     r_health = Jaccard(coverage_t, user_tags) - Jaccard(coverage_{t-1}, user_tags)
-               Marginal health gain from the current selection.  Bounded [0, 1].
-               Zero for items that add no new health-relevant tags.
 """
 
 import torch
 import torch.nn.functional as F
-from typing import Dict, List, Literal, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 
 class RecommendationEnv:
@@ -41,10 +35,8 @@ class RecommendationEnv:
     K : int
         Episode length (recommendation list length).
     val_pos_items : dict[int, set[int]], optional
-        Held-out positive item indices per user (val split).  When provided,
-        selecting one of these items yields r_rel = 1; otherwise r_rel = 0.
-        Should **not** include train positives (they are already excluded from
-        the candidate pools).
+        Held-out positive item indices per user (val split). Selecting one of
+        these yields r_rel = 1; otherwise r_rel = 0.
     device : torch.device
     """
 
@@ -120,7 +112,6 @@ class RecommendationEnv:
         assert 0 <= action < len(self._remaining), \
             f"action {action} out of range (remaining={len(self._remaining)})"
 
-        # Track frozen-scorer rank for diagnostics (no gradient use)
         user_vec = self.user_emb[self._user_id]
         remaining_indices_before = torch.tensor(self._remaining, dtype=torch.long, device=self.device)
         remaining_scores_before = self.item_emb[remaining_indices_before] @ user_vec
@@ -132,26 +123,26 @@ class RecommendationEnv:
 
         item_vec = self.item_emb[item_idx]
 
-        # ---- r_rel: sparse binary relevance from held-out val positives ----
+        # ---- r_rel: binary hit against held-out val positives ----
         r_rel = 1.0 if item_idx in self.val_pos_items.get(self._user_id, set()) else 0.0
 
         # ---- update aggregated embedding (incremental mean) ----
         t = len(self._selected)
-        self._agg_emb = (self._agg_emb * (t - 1) + item_vec) / t
+        agg_emb = self._agg_emb
+        self._agg_emb = (agg_emb * (t - 1) + item_vec) / t
 
-        # ---- marginal health gain: Jaccard(coverage_t) - Jaccard(coverage_{t-1}) ----
+        # ---- r_health: marginal Jaccard gain from adding this item ----
         user_tag_vec = self.user_tags[self._user_id]
         old_coverage = self._tag_coverage
-        old_intersection = torch.sum(torch.min(old_coverage, user_tag_vec))
+        old_inter = torch.sum(torch.min(old_coverage, user_tag_vec))
         old_union = torch.sum(torch.max(old_coverage, user_tag_vec))
-        old_jaccard = (old_intersection / (old_union + 1e-8)).item()
+        old_jaccard = (old_inter / (old_union + 1e-8)).item()
 
         new_item_tags = self.item_tags[item_idx]
         self._tag_coverage = torch.clamp(old_coverage + new_item_tags, max=1.0)
-
-        new_intersection = torch.sum(torch.min(self._tag_coverage, user_tag_vec))
+        new_inter = torch.sum(torch.min(self._tag_coverage, user_tag_vec))
         new_union = torch.sum(torch.max(self._tag_coverage, user_tag_vec))
-        new_jaccard = (new_intersection / (new_union + 1e-8)).item()
+        new_jaccard = (new_inter / (new_union + 1e-8)).item()
         r_health = new_jaccard - old_jaccard
 
         self._t += 1

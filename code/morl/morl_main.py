@@ -76,6 +76,8 @@ def main():
                         help='Optional W&B entity/team.')
     parser.add_argument('--wandb_mode', type=str, default='offline', choices=['online', 'offline', 'disabled'],
                         help='W&B mode. Use offline for terminal-only workflows and wandb beta leet.')
+    parser.add_argument('--val_eval_every', type=int, default=50,
+                        help='Evaluate on the val split every N epochs during training and log to W&B.')
     parser.add_argument('--run_name', type=str, default=None,
                         help='Optional run name for logging outputs and W&B.')
     args = parser.parse_args()
@@ -116,6 +118,8 @@ def main():
             logger.info('LEET charts begin populating after the first epoch is logged.')
     else:
         logger.info('W&B tracking is disabled. Pass --use_wandb to enable local live plots and metric history.')
+
+    tracker.define_metrics()
 
     # ------------------------------------------------------------------
     # Phase 1: Load frozen embeddings
@@ -236,6 +240,7 @@ def main():
         ema_alpha=args.ema_alpha,
         checkpoint_dir=args.output_dir,
         log_every=args.log_every,
+        val_eval_every=args.val_eval_every,
         metrics_path=metrics_path,
         logger=logger,
         tracker=tracker,

@@ -279,6 +279,7 @@ def train_morl(
     checkpoint_dir: str = '.',
     checkpoint_every: int = 10,
     log_every: int = 10,
+    val_eval_every: int = 50,
     metrics_path: Optional[str] = None,
     logger: Optional[logging.Logger] = None,
     tracker: Optional[Any] = None,
@@ -356,6 +357,19 @@ def train_morl(
         'Val-positive coverage: %d / %d train users have ≥1 val positive in their training pool.',
         users_with_val_positives, len(train_user_ids),
     )
+
+    # ----- Pre-build validation candidate pools (reused for periodic in-training eval) -----
+    val_pools_cache: Optional[Dict[int, List[int]]] = None
+    val_pos_list: Dict[int, List[int]] = {u: list(s) for u, s in val_pos.items()}
+    if val_user_ids and val_pos_list:
+        logger.info('Pre-building validation candidate pools for periodic eval ...')
+        _val_pools_full = build_candidate_pools(
+            user_emb, item_emb, M=M,
+            exclude_per_user=exclude_per_user_val,
+            device=dev,
+        )
+        val_pools_cache = {u: _val_pools_full[u] for u in val_user_ids if u in _val_pools_full}
+        logger.info('Validation pools ready for %d users.', len(val_pools_cache))
 
     # ----- Instantiate environment -----
     env = RecommendationEnv(
@@ -494,6 +508,12 @@ def train_morl(
                 if chosen_score_ranks else 0.0
             ),
             'grad_norm': grad_norm,
+            # --- Derived metrics for hyperparameter tuning ---
+            'rel_hit_rate': _safe_mean(episode_rel_hits) / max(1, K),
+            'reward_balance': (
+                _safe_mean(episode_mean_reward_health)
+                / (_safe_mean(episode_mean_reward_rel) + _safe_mean(episode_mean_reward_health) + 1e-8)
+            ),
         }
 
         if selected_positions:
@@ -537,6 +557,33 @@ def train_morl(
         if epoch_stats['mean_normalized_entropy'] < 0.1:
             logger.warning('Epoch %d normalised action entropy very low (%.4f).', epoch, epoch_stats['mean_normalized_entropy'])
 
+        # ----- Periodic validation evaluation -----
+        if (
+            val_pools_cache is not None
+            and val_eval_every > 0
+            and epoch % val_eval_every == 0
+        ):
+            in_train_val = evaluate_morl(
+                policy=policy,
+                user_emb=user_emb, item_emb=item_emb,
+                user_tags=user_tags, item_tags=item_tags,
+                eval_user_ids=val_user_ids,
+                pos_items_per_user=val_pos_list,
+                candidate_pools=val_pools_cache,
+                K=K, M=M, device=dev,
+            )
+            if metrics_path is not None:
+                append_jsonl(metrics_path, {'type': 'val_epoch', 'epoch': epoch, **in_train_val})
+            if tracker is not None:
+                tracker.log({f'val/{key}': value for key, value in in_train_val.items()}, step=epoch)
+            logger.info(
+                'Epoch %4d VAL  | ndcg=%.5f recall=%.5f health=%.5f diversity=%.5f',
+                epoch,
+                in_train_val['ndcg'], in_train_val['recall'],
+                in_train_val['health_score'], in_train_val['diversity'],
+            )
+            policy.train()
+
         if epoch % checkpoint_every == 0:
             ckpt_path = os.path.join(checkpoint_dir, f'morl_policy_epoch{epoch}.pt')
             torch.save(
@@ -576,11 +623,17 @@ def evaluate_morl(
     eval_user_ids: List[int],
     pos_items_per_user: Dict[int, List[int]],
     exclude_per_user: Optional[Dict[int, set]] = None,
+    candidate_pools: Optional[Dict[int, List[int]]] = None,
     K: int = 20,
     M: int = 200,
     device: Optional[torch.device] = None,
 ) -> Dict[str, float]:
     """Evaluate a trained MORL policy on *eval_user_ids*.
+
+    Parameters
+    ----------
+    candidate_pools : pre-built pools to skip the expensive pool-building step.
+        When provided, *exclude_per_user* and *M* are ignored for pool construction.
 
     Returns
     -------
@@ -589,12 +642,15 @@ def evaluate_morl(
     dev = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     policy.eval()
 
-    pools = build_candidate_pools(
-        user_emb, item_emb, M=M,
-        exclude_per_user=exclude_per_user,
-        device=dev,
-    )
-    eval_pools = {u: pools[u] for u in eval_user_ids if u in pools}
+    if candidate_pools is not None:
+        eval_pools = {u: candidate_pools[u] for u in eval_user_ids if u in candidate_pools}
+    else:
+        pools = build_candidate_pools(
+            user_emb, item_emb, M=M,
+            exclude_per_user=exclude_per_user,
+            device=dev,
+        )
+        eval_pools = {u: pools[u] for u in eval_user_ids if u in pools}
 
     env = RecommendationEnv(
         user_emb=user_emb,

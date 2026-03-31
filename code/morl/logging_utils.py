@@ -128,6 +128,31 @@ class WandbTracker:
         if self.enabled and self.run is not None and self._wandb is not None:
             self._wandb.log(payload, step=step)
 
+    def define_metrics(self) -> None:
+        """Register W&B metric axes so all panels share the epoch x-axis.
+
+        Call once after wandb.init() and before the first log().
+        Creates three groups of panels:
+          - train/*  : per-epoch training diagnostics
+          - val/*    : periodic validation curves (ndcg, recall, health_score, diversity)
+          - test/*   : final held-out metrics
+        """
+        if not self.enabled or self.run is None or self._wandb is None:
+            return
+        # Declare the step axis used by all MORL metrics
+        self._wandb.define_metric('epoch')
+        self._wandb.define_metric('train/*', step_metric='epoch')
+        self._wandb.define_metric('val/*',   step_metric='epoch')
+        self._wandb.define_metric('test/*',  step_metric='epoch')
+        # Key hyperparam-tuning panels — surface these as summary metrics
+        for metric in (
+            'val/ndcg', 'val/recall', 'val/health_score', 'val/diversity',
+            'test/ndcg', 'test/recall', 'test/health_score',
+            'train/rel_hit_rate', 'train/reward_balance',
+            'train/mean_normalized_entropy', 'train/grad_norm',
+        ):
+            self._wandb.define_metric(metric, summary='max' if 'ndcg' in metric or 'recall' in metric or 'hit' in metric else 'last')
+
     def log_table(self, name: str, rows: list, columns: list) -> None:
         if self.enabled and self.run is not None and self._wandb is not None:
             table = self._wandb.Table(columns=columns, data=rows)
