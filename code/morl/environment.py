@@ -8,10 +8,14 @@ Action:
     index into the candidate pool (items not yet selected in this episode).
 
 Reward (2-component scalar, summed in training with a fixed beta weight):
-    r_rel    = 1 if the selected item is in val_pos_items[user], else 0.
+    r_rel    = 0.0 for all steps except the terminal step.
+               On the terminal step (t == K): r_rel = NDCG@K(selected_list, val_pos_items[user]).
+               This directly optimises the evaluation metric rather than per-step proxies.
     r_health = Jaccard(coverage_t, user_tags) - Jaccard(coverage_{t-1}, user_tags)
+               Marginal Jaccard gain computed at every step.
 """
 
+import math
 import torch
 import torch.nn.functional as F
 from typing import Dict, List, Optional, Set, Tuple
@@ -123,13 +127,22 @@ class RecommendationEnv:
 
         item_vec = self.item_emb[item_idx]
 
-        # ---- r_rel: binary hit against held-out val positives ----
-        r_rel = 1.0 if item_idx in self.val_pos_items.get(self._user_id, set()) else 0.0
+        # ---- update aggregated embedding first so self._t is consistent ----
+        # (r_rel is computed after done is known; health uses updated coverage)
 
         # ---- update aggregated embedding (incremental mean) ----
         t = len(self._selected)
         agg_emb = self._agg_emb
         self._agg_emb = (agg_emb * (t - 1) + item_vec) / t
+
+        self._t += 1
+        done = (self._t >= self.K) or (len(self._remaining) == 0)
+
+        # ---- r_rel: terminal NDCG@K (0 for all non-terminal steps) ----
+        if done:
+            r_rel = self._compute_ndcg_at_k(self._selected, self._user_id)
+        else:
+            r_rel = 0.0
 
         # ---- r_health: marginal Jaccard gain from adding this item ----
         user_tag_vec = self.user_tags[self._user_id]
@@ -145,14 +158,14 @@ class RecommendationEnv:
         new_jaccard = (new_inter / (new_union + 1e-8)).item()
         r_health = new_jaccard - old_jaccard
 
-        self._t += 1
-        done = (self._t >= self.K) or (len(self._remaining) == 0)
         reward = torch.tensor([r_rel, r_health], dtype=torch.float32, device=self.device)
         self.last_step_info = {
             'chosen_score': chosen_score.item(),
             'chosen_score_rank_1based': float(chosen_rank_1based),
+            'list_rank': self._t,          # 1-indexed rank just assigned
             'r_rel': r_rel,
             'r_health': r_health,
+            'terminal': done,
         }
 
         return self._build_state(), reward, done
@@ -177,6 +190,22 @@ class RecommendationEnv:
         tag_coverage = self._tag_coverage
         timestep = torch.tensor([self._t / self.K], device=self.device)
         return torch.cat([user_vec, agg_emb, tag_coverage, timestep])
+
+    def _compute_ndcg_at_k(self, selected: List[int], user_id: int) -> float:
+        """Compute NDCG@K for the completed episode list against val positives."""
+        pos = self.val_pos_items.get(user_id, set())
+        if not pos:
+            return 0.0
+        dcg = sum(
+            1.0 / math.log2(rank + 1)
+            for rank, item in enumerate(selected, start=1)
+            if item in pos
+        )
+        idcg = sum(
+            1.0 / math.log2(i + 1)
+            for i in range(1, min(len(pos), len(selected)) + 1)
+        )
+        return dcg / idcg if idcg > 0.0 else 0.0
 
 
 # ------------------------------------------------------------------

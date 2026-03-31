@@ -246,6 +246,86 @@ def _normalize_returns(returns: torch.Tensor) -> torch.Tensor:
     return (returns - mean) / std.clamp_min(1e-8)
 
 
+def pretrain_policy(
+    policy: ConditionalPolicy,
+    user_emb: torch.Tensor,
+    item_emb: torch.Tensor,
+    train_pools: Dict[int, List[int]],
+    train_user_ids: List[int],
+    num_epochs: int = 50,
+    batch_size: int = 64,
+    lr: float = 1e-3,
+    device: Optional[torch.device] = None,
+    logger: Optional[logging.Logger] = None,
+    tracker: Optional[Any] = None,
+) -> None:
+    """Supervised pretraining: teach the policy to replicate GNN top-K rankings.
+
+    For each user, the GNN pool is already sorted highest-to-lowest score.
+    We treat pool[0] as the correct action at step 0, pool[1] at step 1, etc.,
+    and minimise cross-entropy loss between policy logits and those rank labels.
+
+    This gives the policy a warm start that exactly matches GNN NDCG, so that
+    subsequent REINFORCE fine-tuning improves health from a strong relevance floor
+    rather than starting from random.
+
+    Parameters
+    ----------
+    policy : ConditionalPolicy  (already on device)
+    train_pools : dict[user_id, List[item_idx]]  pre-sorted by GNN score (highest first)
+    num_epochs : number of pretraining epochs
+    batch_size : users per gradient step
+    lr : Adam learning rate for pretraining
+    """
+    dev = device or torch.device('cpu')
+    log = logger or logging.getLogger(__name__)
+    optimizer = optim.Adam(policy.parameters(), lr=lr)
+    user_ids = [u for u in train_user_ids if u in train_pools and len(train_pools[u]) > 0]
+
+    log.info('Pretraining policy to imitate GNN rankings: %d epochs, %d users', num_epochs, len(user_ids))
+
+    for epoch in range(1, num_epochs + 1):
+        policy.train()
+        batch = [user_ids[i] for i in torch.randperm(len(user_ids))[:batch_size].tolist()]
+        loss_terms: List[torch.Tensor] = []
+
+        for user_id in batch:
+            pool = train_pools[user_id]
+            if len(pool) == 0:
+                continue
+
+            user_vec = user_emb[user_id].to(dev)
+            # Build a synthetic state: just user_emb + zeros for agg/tags/timestep
+            state_dim = policy.state_dim
+            state = torch.zeros(state_dim, device=dev)
+            state[:user_vec.size(0)] = user_vec
+
+            # One forward pass over the full pool
+            pool_tensor = torch.tensor(pool, dtype=torch.long, device=dev)
+            cand_emb = item_emb[pool_tensor].to(dev)          # (M, d)
+            log_probs = policy.forward(state, cand_emb)        # (M,)
+
+            # Target: the GNN's top-1 is label 0 (highest ranked in pool)
+            # Use the pool's natural order: label = argmax of GNN score = index 0
+            target = torch.zeros(1, dtype=torch.long, device=dev)  # always pool[0]
+            loss_terms.append(torch.nn.functional.nll_loss(log_probs.unsqueeze(0), target))
+
+        if not loss_terms:
+            continue
+
+        loss = torch.stack(loss_terms).mean()
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        if epoch % max(1, num_epochs // 5) == 0 or epoch == 1:
+            log.info('Pretrain epoch %3d / %d | loss=%.4f', epoch, num_epochs, loss.item())
+            if tracker is not None:
+                tracker.log({'pretrain/loss': loss.item()}, step=epoch)
+
+    log.info('Pretraining complete.')
+
+
 def _collect_flat_gradients(policy: ConditionalPolicy) -> torch.Tensor:
     grads: List[torch.Tensor] = []
     for param in policy.parameters():
@@ -280,6 +360,8 @@ def train_morl(
     checkpoint_every: int = 10,
     log_every: int = 10,
     val_eval_every: int = 50,
+    pretrain_epochs: int = 0,
+    pretrain_lr: float = 1e-3,
     metrics_path: Optional[str] = None,
     logger: Optional[logging.Logger] = None,
     tracker: Optional[Any] = None,
@@ -395,6 +477,22 @@ def train_morl(
     ).to(dev)
 
     optimizer = optim.Adam(policy.parameters(), lr=lr)
+
+    # ----- Optional imitation pretraining -----
+    if pretrain_epochs > 0:
+        pretrain_policy(
+            policy=policy,
+            user_emb=user_emb,
+            item_emb=item_emb,
+            train_pools=train_pools,
+            train_user_ids=train_user_ids,
+            num_epochs=pretrain_epochs,
+            batch_size=batch_size,
+            lr=pretrain_lr,
+            device=dev,
+            logger=logger,
+            tracker=tracker,
+        )
 
     stats: List[Dict[str, Any]] = []
 

@@ -78,6 +78,10 @@ def main():
                         help='W&B mode. Use offline for terminal-only workflows and wandb beta leet.')
     parser.add_argument('--val_eval_every', type=int, default=50,
                         help='Evaluate on the val split every N epochs during training and log to W&B.')
+    parser.add_argument('--pretrain_epochs', type=int, default=0,
+                        help='Epochs of imitation pretraining to replicate GNN rankings before REINFORCE. 0 = disabled.')
+    parser.add_argument('--pretrain_lr', type=float, default=1e-3,
+                        help='Learning rate for imitation pretraining phase.')
     parser.add_argument('--run_name', type=str, default=None,
                         help='Optional run name for logging outputs and W&B.')
     args = parser.parse_args()
@@ -241,6 +245,8 @@ def main():
         checkpoint_dir=args.output_dir,
         log_every=args.log_every,
         val_eval_every=args.val_eval_every,
+        pretrain_epochs=args.pretrain_epochs,
+        pretrain_lr=args.pretrain_lr,
         metrics_path=metrics_path,
         logger=logger,
         tracker=tracker,
