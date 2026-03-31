@@ -5,17 +5,19 @@ State:
     s_t = concat(user_emb, agg_emb, tag_coverage, [t / K])
 
 Action:
-    index into the candidate pool (items not yet selected in this episode).
+    index into the candidate list (items not yet selected in this episode).
+    In the full-item-space A2C formulation the candidate list is all items not
+    yet selected, with no pool ceiling.
 
 Reward (2-component scalar, summed in training with a fixed beta weight):
-    r_rel    = 0.0 for all steps except the terminal step.
-               On the terminal step (t == K): r_rel = NDCG@K(selected_list, val_pos_items[user]).
-               This directly optimises the evaluation metric rather than per-step proxies.
+    r_rel    = 1.0 if the selected item is in train_pos_items[user], else 0.0.
+               Fires every step (dense signal).  Uses only train-split labels so
+               there is no val/test leakage — the same supervision signal the GNN
+               was trained on.
     r_health = Jaccard(coverage_t, user_tags) - Jaccard(coverage_{t-1}, user_tags)
                Marginal Jaccard gain computed at every step.
 """
 
-import math
 import torch
 import torch.nn.functional as F
 from typing import Dict, List, Optional, Set, Tuple
@@ -35,12 +37,13 @@ class RecommendationEnv:
     item_tags : torch.Tensor
         Binary health-tag vectors for items, shape (num_items, tag_dim).
     candidate_pools : dict[int, List[int]]
-        Pre-computed top-M item indices per user.
+        Pre-computed candidate item indices per user.  Pass
+        {u: list(range(num_items))} for the full-item-space formulation.
     K : int
         Episode length (recommendation list length).
-    val_pos_items : dict[int, set[int]], optional
-        Held-out positive item indices per user (val split). Selecting one of
-        these yields r_rel = 1; otherwise r_rel = 0.
+    train_pos_items : dict[int, set[int]], optional
+        Train-split positive item indices per user.  Selecting one of these
+        items yields r_rel = 1.0 every step (dense, no leakage).
     device : torch.device
     """
 
@@ -52,7 +55,7 @@ class RecommendationEnv:
         item_tags: torch.Tensor,
         candidate_pools: dict,
         K: int = 20,
-        val_pos_items: Optional[Dict[int, Set[int]]] = None,
+        train_pos_items: Optional[Dict[int, Set[int]]] = None,
         device: Optional[torch.device] = None,
     ):
         self.device = device or torch.device('cpu')
@@ -62,7 +65,7 @@ class RecommendationEnv:
         self.item_tags = item_tags.float().to(self.device)
         self.candidate_pools = candidate_pools
         self.K = K
-        self.val_pos_items: Dict[int, Set[int]] = val_pos_items or {}
+        self.train_pos_items: Dict[int, Set[int]] = train_pos_items or {}
 
         self.d = user_emb.size(1)
         self.tag_dim = user_tags.size(1)
@@ -138,11 +141,8 @@ class RecommendationEnv:
         self._t += 1
         done = (self._t >= self.K) or (len(self._remaining) == 0)
 
-        # ---- r_rel: terminal NDCG@K (0 for all non-terminal steps) ----
-        if done:
-            r_rel = self._compute_ndcg_at_k(self._selected, self._user_id)
-        else:
-            r_rel = 0.0
+        # ---- r_rel: per-step binary hit on train positives (no leakage) ----
+        r_rel = 1.0 if item_idx in self.train_pos_items.get(self._user_id, set()) else 0.0
 
         # ---- r_health: marginal Jaccard gain from adding this item ----
         user_tag_vec = self.user_tags[self._user_id]
@@ -191,21 +191,6 @@ class RecommendationEnv:
         timestep = torch.tensor([self._t / self.K], device=self.device)
         return torch.cat([user_vec, agg_emb, tag_coverage, timestep])
 
-    def _compute_ndcg_at_k(self, selected: List[int], user_id: int) -> float:
-        """Compute NDCG@K for the completed episode list against val positives."""
-        pos = self.val_pos_items.get(user_id, set())
-        if not pos:
-            return 0.0
-        dcg = sum(
-            1.0 / math.log2(rank + 1)
-            for rank, item in enumerate(selected, start=1)
-            if item in pos
-        )
-        idcg = sum(
-            1.0 / math.log2(i + 1)
-            for i in range(1, min(len(pos), len(selected)) + 1)
-        )
-        return dcg / idcg if idcg > 0.0 else 0.0
 
 
 # ------------------------------------------------------------------

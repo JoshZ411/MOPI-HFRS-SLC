@@ -82,6 +82,12 @@ def main():
                         help='Epochs of imitation pretraining to replicate GNN rankings before REINFORCE. 0 = disabled.')
     parser.add_argument('--pretrain_lr', type=float, default=1e-3,
                         help='Learning rate for imitation pretraining phase.')
+    parser.add_argument('--value_coef', type=float, default=0.5,
+                        help='Weight on the critic (value) loss in A2C total loss.')
+    parser.add_argument('--M_train', type=int, default=None,
+                        help='Candidate pool size used ONLY during RL training. '
+                             'Defaults to num_items (full item space). '
+                             'Eval pools still use --M.')
     parser.add_argument('--run_name', type=str, default=None,
                         help='Optional run name for logging outputs and W&B.')
     args = parser.parse_args()
@@ -133,6 +139,9 @@ def main():
     user_emb = ckpt['user_emb']   # (num_users, d)
     item_emb = ckpt['item_emb']   # (num_items, d)
     logger.info('Embedding shapes: user_emb=%s item_emb=%s', tuple(user_emb.shape), tuple(item_emb.shape))
+    num_items = item_emb.size(0)
+    m_train = num_items if args.M_train is None else args.M_train
+    logger.info('Training pool size: M_train=%d (%s)', m_train, 'full item space' if args.M_train is None else 'custom')
 
     # ------------------------------------------------------------------
     # Load graph for tags and edge splits
@@ -229,11 +238,13 @@ def main():
         item_tags=food_tags,
         train_user_ids=train_users,
         val_user_ids=val_users,
+        train_pos_items={u: set(items) for u, items in train_pos.items()},
         val_pos_items={u: set(items) for u, items in val_pos.items()},
-        exclude_per_user_train=exclude_val,
+        exclude_per_user_train=None,
         exclude_per_user_val=exclude_val,
         K=args.K,
-        M=args.M,
+        M=m_train,
+        eval_M=args.M,
         hidden_dim=args.hidden_dim,
         num_epochs=args.epochs,
         batch_size=args.batch_size,
@@ -241,6 +252,7 @@ def main():
         gamma=args.gamma,
         beta=args.beta,
         entropy_coef=args.entropy_coef,
+        value_coef=args.value_coef,
         ema_alpha=args.ema_alpha,
         checkpoint_dir=args.output_dir,
         log_every=args.log_every,

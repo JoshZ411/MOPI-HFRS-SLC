@@ -1,17 +1,24 @@
 """
-MORL training loop: scalarized REINFORCE with a cross-episode EMA baseline.
+MORL training loop: A2C (Advantage Actor-Critic) with full item space.
 
-Reward formulation (Option 1 — val-positive sparse binary):
-    r_rel    = 1 if selected item is in val_pos_items[user], else 0.
+Reward formulation:
+    r_rel    = 1.0 if the selected item is in train_pos_items[user], else 0.0.
+               Dense per-step signal.  Uses only train-split labels — no
+               val/test leakage.  Same supervision source as the frozen GNN.
     r_health = marginal Jaccard gain: Jaccard(coverage_t) - Jaccard(coverage_{t-1}).
     combined = r_rel + beta * r_health   (single scalar per step, fixed beta)
 
-Baseline: exponential moving average of per-episode returns, updated across
-the entire training run.  Replaces within-episode return normalisation to
-preserve cross-episode signal (critical when r_rel is sparse).
+Baseline: learned value function V(s_t) from a small MLP critic (ValueHead).
+    Advantage = R_t - V(s_t).detach()
+    The critic is trained jointly with policy loss:
+        total_loss = policy_loss + value_coef * value_loss - entropy_coef * entropy
+
+Candidate set: all num_items items not yet selected in the episode (no pool
+    ceiling).  This removes the structural recall ceiling that capped NDCG
+    below baseline when using a 500-item pool.
 
 No gradients flow into the frozen GNN embeddings.
-Only the ConditionalPolicy parameters are updated.
+Only the ConditionalPolicy and ValueHead parameters are updated.
 """
 
 import logging
@@ -20,11 +27,37 @@ import os
 from typing import Any, Dict, List, Literal, Optional, Sequence, Set, Tuple, cast
 
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 
 from .environment import RecommendationEnv, build_candidate_pools
 from .logging_utils import append_jsonl
 from .policy import ConditionalPolicy
+
+
+class ValueHead(nn.Module):
+    """Small MLP critic V(s_t) for A2C advantage estimation.
+
+    Parameters
+    ----------
+    state_dim : int  dimensionality of the environment state vector.
+    hidden_dim : int  width of the single hidden layer.
+    """
+
+    def __init__(self, state_dim: int, hidden_dim: int = 256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, 1),
+        )
+
+    def forward(self, state: torch.Tensor) -> torch.Tensor:
+        """Return scalar value estimate V(s).  Input shape (state_dim,) or (B, state_dim)."""
+        return self.net(state).squeeze(-1)
 
 
 def run_episode(
@@ -33,18 +66,21 @@ def run_episode(
     user_id: int,
     device: torch.device,
     beta: float = 0.5,
+    value_head: Optional['ValueHead'] = None,
 ):
     """Roll out one K-step episode for a single user.
 
     Returns
     -------
-    log_probs     : List[torch.Tensor]  per-step log π(a_t | s_t)
-    combined_rewards : torch.Tensor    shape (T,)  r_rel + beta * r_health per step
-    entropy_terms : List[torch.Tensor] per-step normalised entropy values
-    diagnostics   : dict
+    log_probs        : List[torch.Tensor]  per-step log π(a_t | s_t)
+    combined_rewards : torch.Tensor        shape (T,)  r_rel + beta * r_health
+    entropy_terms    : List[torch.Tensor]  per-step normalised entropy values
+    states           : List[torch.Tensor]  per-step state vectors (for A2C critic)
+    diagnostics      : dict
     """
     state = env.reset(user_id).to(device)
     log_probs: List[torch.Tensor] = []
+    states: List[torch.Tensor] = []
     reward_rel: List[torch.Tensor] = []
     reward_health: List[torch.Tensor] = []
     entropy_terms: List[torch.Tensor] = []
@@ -63,6 +99,9 @@ def run_episode(
             break
 
         candidate_embeddings = env.item_emb[remaining]
+
+        # Store state before action for the critic
+        states.append(state.detach())
 
         action, log_prob, normalized_entropy, info = cast(
             Tuple[int, torch.Tensor, torch.Tensor, Dict[str, float]],
@@ -110,7 +149,7 @@ def run_episode(
         'mean_reward_health': float(health_tensor.mean().item()),
         'episode_return': float(combined_rewards.sum().item()),
     }
-    return log_probs, combined_rewards, entropy_terms, diagnostics
+    return log_probs, combined_rewards, entropy_terms, states, diagnostics
 
 
 def _safe_mean(values: Sequence[float]) -> float:
@@ -343,11 +382,13 @@ def train_morl(
     item_tags: torch.Tensor,
     train_user_ids: List[int],
     val_user_ids: List[int],
+    train_pos_items: Optional[Dict[int, Set[int]]] = None,
     val_pos_items: Optional[Dict[int, Set[int]]] = None,
     exclude_per_user_train: Optional[Dict[int, set]] = None,
     exclude_per_user_val: Optional[Dict[int, set]] = None,
     K: int = 20,
     M: int = 200,
+    eval_M: Optional[int] = None,
     hidden_dim: int = 256,
     num_epochs: int = 200,
     batch_size: int = 64,
@@ -355,6 +396,7 @@ def train_morl(
     gamma: float = 1.0,
     beta: float = 0.5,
     entropy_coef: float = 0.01,
+    value_coef: float = 0.5,
     ema_alpha: float = 0.05,
     checkpoint_dir: str = '.',
     checkpoint_every: int = 10,
@@ -367,33 +409,20 @@ def train_morl(
     tracker: Optional[Any] = None,
     device: Optional[torch.device] = None,
 ) -> ConditionalPolicy:
-    """Train the MORL conditional policy (Option 1 — val-positive sparse binary reward).
+    """Train the MORL conditional policy with A2C (full item space, train-positive r_rel).
 
     Parameters
     ----------
-    user_emb, item_emb : frozen embeddings from SGSL training.
-    user_tags, item_tags : binary health-tag tensors.
-    train_user_ids : user indices used for RL training episodes.
-    val_user_ids : user indices used for validation (held out from RL training).
-    val_pos_items : dict mapping user_id → set of val-split positive item indices.
-        Selecting one of these items in an episode yields r_rel = 1.
-        Should contain val positives only (train positives are already excluded
-        from the candidate pools via exclude_per_user_train).
-    exclude_per_user_train : item indices to mask from training candidate pools.
-    exclude_per_user_val : item indices to mask from validation candidate pools
-        (typically train + val positives so the eval pool contains only test items).
-    K : recommendation list length.
-    M : candidate pool size.
-    hidden_dim : policy hidden layer width.
-    num_epochs : number of training epochs.
-    batch_size : users per gradient step.
-    lr : Adam learning rate.
-    gamma : discount factor for reward-to-go.
-    beta : weight on the marginal health reward relative to the sparse relevance hit.
-    entropy_coef : coefficient for normalised entropy regularisation.
-    ema_alpha : smoothing factor for the cross-episode EMA return baseline.
-    checkpoint_dir : directory to save policy checkpoints.
-    checkpoint_every : save every N epochs.
+    train_pos_items : dict mapping user_id -> set of train-split positive item indices.
+        Used as r_rel reward signal per step.  No val/test leakage.
+    val_pos_items : dict mapping user_id -> set of val-split positive item indices.
+        Used ONLY for periodic val eval, never in the reward signal.
+    exclude_per_user_train : pass None for full-item-space training so train positives
+        remain selectable (they are the r_rel signal).
+    eval_M : pool size to use for periodic val evaluation.  Defaults to M (the training
+        pool size) when None, but you almost always want this at the standard 500 so
+        that val metrics are comparable to the final eval-time setting.
+    value_coef : weight on value (critic) loss in total_loss.
 
     Returns
     -------
@@ -403,6 +432,7 @@ def train_morl(
     os.makedirs(checkpoint_dir, exist_ok=True)
     logger = logger or logging.getLogger(__name__)
 
+    train_pos: Dict[int, Set[int]] = train_pos_items or {}
     val_pos: Dict[int, Set[int]] = val_pos_items or {}
 
     # ----- Build candidate pools (fixed for entire RL training) -----
@@ -446,7 +476,7 @@ def train_morl(
     if val_user_ids and val_pos_list:
         logger.info('Pre-building validation candidate pools for periodic eval ...')
         _val_pools_full = build_candidate_pools(
-            user_emb, item_emb, M=M,
+            user_emb, item_emb, M=eval_M if eval_M is not None else M,
             exclude_per_user=exclude_per_user_val,
             device=dev,
         )
@@ -461,7 +491,7 @@ def train_morl(
         item_tags=item_tags,
         candidate_pools=train_pools,
         K=K,
-        val_pos_items=val_pos,
+        train_pos_items=train_pos,
         device=dev,
     )
 
@@ -475,8 +505,11 @@ def train_morl(
         candidate_dim=candidate_dim,
         hidden_dim=hidden_dim,
     ).to(dev)
+    value_head = ValueHead(state_dim=state_dim, hidden_dim=hidden_dim).to(dev)
 
-    optimizer = optim.Adam(policy.parameters(), lr=lr)
+    optimizer = optim.Adam(
+        list(policy.parameters()) + list(value_head.parameters()), lr=lr,
+    )
 
     # ----- Optional imitation pretraining -----
     if pretrain_epochs > 0:
@@ -502,7 +535,7 @@ def train_morl(
         num_epochs, batch_size, K, M, lr, hidden_dim, gamma, beta, entropy_coef, ema_alpha,
     )
 
-    # Cross-episode EMA baseline — updated once per episode across the whole run
+    # EMA baseline kept as a diagnostic scalar only (not used for advantage)
     ema_baseline: float = 0.0
     final_epoch = 0
 
@@ -528,10 +561,11 @@ def train_morl(
         episode_mean_reward_rel: List[float] = []
         episode_mean_reward_health: List[float] = []
         policy_loss_terms: List[torch.Tensor] = []
+        value_loss_terms: List[torch.Tensor] = []
 
         for user_id in batch_users:
-            log_probs, combined_rewards, entropy_terms, episode_diag = run_episode(
-                env, policy, user_id, dev, beta=beta,
+            log_probs, combined_rewards, entropy_terms, ep_states, episode_diag = run_episode(
+                env, policy, user_id, dev, beta=beta, value_head=value_head,
             )
             if entropy_terms:
                 entropy_bonus_terms.append(torch.stack(entropy_terms).mean())
@@ -539,17 +573,21 @@ def train_morl(
             # Reward-to-go under gamma
             raw_returns = _discounted_returns(combined_rewards, gamma)
 
-            # Cross-episode EMA baseline subtraction
-            G0 = float(raw_returns[0].item())
-            advantage_returns = raw_returns - ema_baseline
-            # Update EMA baseline with this episode's total return
-            ema_baseline = (1.0 - ema_alpha) * ema_baseline + ema_alpha * G0
+            # ---- A2C: learned critic advantage ----
+            states_tensor = torch.stack(ep_states).to(dev)   # (T, state_dim)
+            values = value_head(states_tensor)                 # (T,)
+            advantages = raw_returns - values.detach()
 
             log_prob_tensor = torch.stack(log_probs)
-            policy_loss_terms.append(-(log_prob_tensor * advantage_returns.detach()).sum())
+            policy_loss_terms.append(-(log_prob_tensor * advantages).sum())
+            value_loss_terms.append(F.mse_loss(values, raw_returns.detach()))
+
+            G0 = float(raw_returns[0].item())
+            # Update EMA as a diagnostic only
+            ema_baseline = (1.0 - ema_alpha) * ema_baseline + ema_alpha * G0
 
             episode_returns.append(G0)
-            episode_advantages.append(float(advantage_returns.mean().item()))
+            episode_advantages.append(float(advantages.mean().item()))
             episode_lengths.append(float(episode_diag['episode_length']))
             entropies.append(episode_diag['mean_entropy'])
             normalized_entropies.append(episode_diag['mean_normalized_entropy'])
@@ -563,21 +601,28 @@ def train_morl(
             episode_mean_reward_health.append(episode_diag['mean_reward_health'])
 
         policy_loss_raw = torch.stack(policy_loss_terms).mean()
+        value_loss = (
+            torch.stack(value_loss_terms).mean()
+            if value_loss_terms
+            else policy_loss_raw.new_zeros(())
+        )
         entropy_bonus = (
             torch.stack(entropy_bonus_terms).mean()
             if entropy_bonus_terms
             else policy_loss_raw.new_zeros(())
         )
-        policy_loss = policy_loss_raw - entropy_coef * entropy_bonus
+        total_loss = policy_loss_raw + value_coef * value_loss - entropy_coef * entropy_bonus
 
         optimizer.zero_grad()
-        policy_loss.backward()
+        total_loss.backward()
         grad_norm = _grad_norm(policy)
         optimizer.step()
 
         epoch_stats = {
             'epoch': epoch,
-            'policy_loss': policy_loss.item(),
+            'policy_loss': float(policy_loss_raw.detach().cpu()),
+            'value_loss': float(value_loss.detach().cpu()),
+            'total_loss': float(total_loss.detach().cpu()),
             'ema_baseline': ema_baseline,
             'beta': beta,
             'mean_episode_return': _safe_mean(episode_returns),
@@ -631,11 +676,14 @@ def train_morl(
 
         if epoch % log_every == 0:
             logger.info(
-                'Epoch %4d | loss=%.4f | return=%.4f±%.4f adv=%.4f ema_base=%.4f | '
+                'Epoch %4d | policy_loss=%.4f val_loss=%.4f total=%.4f | '
+                'return=%.4f±%.4f adv=%.4f ema_base=%.4f | '
                 'rel_hits=%.2f reward[rel/h]=%.4f/%.4f | '
                 'rank=%.2f top10=%.3f entropy=%.4f entropy_norm=%.4f grad=%.4f',
                 epoch,
                 epoch_stats['policy_loss'],
+                epoch_stats['value_loss'],
+                epoch_stats['total_loss'],
                 epoch_stats['mean_episode_return'],
                 epoch_stats['std_episode_return'],
                 epoch_stats['mean_advantage'],
@@ -668,7 +716,7 @@ def train_morl(
                 eval_user_ids=val_user_ids,
                 pos_items_per_user=val_pos_list,
                 candidate_pools=val_pools_cache,
-                K=K, M=M, device=dev,
+                K=K, M=eval_M if eval_M is not None else M, device=dev,
             )
             if metrics_path is not None:
                 append_jsonl(metrics_path, {'type': 'val_epoch', 'epoch': epoch, **in_train_val})
@@ -687,6 +735,7 @@ def train_morl(
             torch.save(
                 {'epoch': epoch,
                  'policy_state_dict': policy.state_dict(),
+                 'value_head_state_dict': value_head.state_dict(),
                  'optimizer_state_dict': optimizer.state_dict(),
                  'stats': stats},
                 ckpt_path,
@@ -700,6 +749,7 @@ def train_morl(
     torch.save(
         {'epoch': final_epoch if final_epoch > 0 else num_epochs,
          'policy_state_dict': policy.state_dict(),
+         'value_head_state_dict': value_head.state_dict(),
          'optimizer_state_dict': optimizer.state_dict(),
          'stats': stats},
         final_path,
