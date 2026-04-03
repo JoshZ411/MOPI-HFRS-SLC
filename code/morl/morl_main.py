@@ -90,6 +90,10 @@ def main():
                              'Eval pools still use --M.')
     parser.add_argument('--run_name', type=str, default=None,
                         help='Optional run name for logging outputs and W&B.')
+    parser.add_argument('--no_amp', action='store_true',
+                        help='Disable Automatic Mixed Precision (AMP/fp16). '
+                             'AMP is enabled by default on CUDA to reduce GPU memory usage. '
+                             'Pass this flag to force fp32 throughout.')
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -263,6 +267,7 @@ def main():
         logger=logger,
         tracker=tracker,
         device=device,
+        use_amp=not args.no_amp,
     )
 
     # ------------------------------------------------------------------

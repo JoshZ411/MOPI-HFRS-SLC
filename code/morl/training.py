@@ -30,6 +30,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+from torch.amp.grad_scaler import GradScaler
+from torch.amp.autocast_mode import autocast as amp_autocast
 
 from .environment import RecommendationEnv, build_candidate_pools
 from .logging_utils import append_jsonl
@@ -91,7 +93,7 @@ def run_episode(
     chosen_score_values: List[float] = []
     selected_probs: List[float] = []
     max_probs: List[float] = []
-    rel_hits: int = 0
+    # rel_hits accumulated as tensor after the loop (avoids K per-step .item() syncs)
 
     while True:
         remaining = env.remaining
@@ -110,8 +112,9 @@ def run_episode(
         state, reward, done = env.step(action)
         state = state.to(device)
 
-        r_rel = reward[0].to(device)
-        r_health = reward[1].to(device)
+        # reward is already on device (env.device == device); .to() is a no-op
+        r_rel = reward[0]
+        r_health = reward[1]
 
         log_probs.append(log_prob)
         reward_rel.append(r_rel)
@@ -125,8 +128,7 @@ def run_episode(
         step_info = env.last_step_info
         chosen_score_ranks.append(step_info.get('chosen_score_rank_1based', 0.0))
         chosen_score_values.append(step_info.get('chosen_score', 0.0))
-        if r_rel.item() > 0.5:
-            rel_hits += 1
+        # Note: no .item() per step — rel_hits computed via tensor op after loop
 
         if done:
             break
@@ -134,6 +136,8 @@ def run_episode(
     rel_tensor = torch.stack(reward_rel)
     health_tensor = torch.stack(reward_health)
     combined_rewards = rel_tensor + beta * health_tensor
+    # Single sync for rel_hits instead of K syncs inside the loop
+    rel_hits = int((rel_tensor > 0.5).sum().item())
 
     diagnostics = {
         'episode_length': len(log_probs),
@@ -340,7 +344,7 @@ def pretrain_policy(
             state[:user_vec.size(0)] = user_vec
 
             # One forward pass over the full pool
-            pool_tensor = torch.tensor(pool, dtype=torch.long, device=dev)
+            pool_tensor = torch.tensor(pool, dtype=torch.long)  # keep on CPU for indexing
             cand_emb = item_emb[pool_tensor].to(dev)          # (M, d)
             log_probs = policy.forward(state, cand_emb)        # (M,)
 
@@ -408,6 +412,7 @@ def train_morl(
     logger: Optional[logging.Logger] = None,
     tracker: Optional[Any] = None,
     device: Optional[torch.device] = None,
+    use_amp: bool = True,
 ) -> ConditionalPolicy:
     """Train the MORL conditional policy with A2C (full item space, train-positive r_rel).
 
@@ -529,6 +534,12 @@ def train_morl(
 
     stats: List[Dict[str, Any]] = []
 
+    # AMP: only active on CUDA; on CPU use_amp is forced off
+    amp_enabled: bool = use_amp and (dev.type == 'cuda')
+    scaler = GradScaler('cuda', enabled=amp_enabled)
+    if amp_enabled:
+        logger.info('Automatic Mixed Precision (AMP) enabled — forward passes will use fp16.')
+
     logger.info(
         'Starting MORL training (Option 1): epochs=%d batch_size=%d K=%d M=%d '
         'lr=%.4g hidden_dim=%d gamma=%.4f beta=%.4g entropy_coef=%.4g ema_alpha=%.4g',
@@ -549,7 +560,6 @@ def train_morl(
         episode_lengths: List[float] = []
         entropies: List[float] = []
         normalized_entropies: List[float] = []
-        entropy_bonus_terms: List[torch.Tensor] = []
         selected_positions: List[int] = []
         chosen_score_ranks: List[float] = []
         chosen_score_values: List[float] = []
@@ -560,34 +570,66 @@ def train_morl(
         episode_rel_hits: List[float] = []
         episode_mean_reward_rel: List[float] = []
         episode_mean_reward_health: List[float] = []
-        policy_loss_terms: List[torch.Tensor] = []
-        value_loss_terms: List[torch.Tensor] = []
+
+        # Float accumulators for loss logging (no live computation graphs needed)
+        acc_policy_loss: float = 0.0
+        acc_value_loss: float = 0.0
+        acc_entropy_bonus: float = 0.0
+
+        # Enable the expensive score-rank diagnostic only on log epochs
+        env.compute_rank = (epoch % log_every == 0)
+
+        # Per-user gradient accumulation:
+        # backward() is called immediately after each user, freeing that user's
+        # computation graph before the next user starts.  This keeps peak GPU
+        # memory proportional to ONE episode (K steps) rather than
+        # batch_size * K steps, which would OOM on a typical 8 GB laptop GPU.
+        n_users = len(batch_users)
+        optimizer.zero_grad()
 
         for user_id in batch_users:
-            log_probs, combined_rewards, entropy_terms, ep_states, episode_diag = run_episode(
-                env, policy, user_id, dev, beta=beta, value_head=value_head,
-            )
-            if entropy_terms:
-                entropy_bonus_terms.append(torch.stack(entropy_terms).mean())
+            with amp_autocast(device_type=dev.type, enabled=amp_enabled):
+                log_probs, combined_rewards, entropy_terms, ep_states, episode_diag = run_episode(
+                    env, policy, user_id, dev, beta=beta, value_head=value_head,
+                )
 
-            # Reward-to-go under gamma
-            raw_returns = _discounted_returns(combined_rewards, gamma)
+                # Reward-to-go under gamma
+                raw_returns = _discounted_returns(combined_rewards, gamma)
 
-            # ---- A2C: learned critic advantage ----
-            states_tensor = torch.stack(ep_states).to(dev)   # (T, state_dim)
-            values = value_head(states_tensor)                 # (T,)
-            advantages = raw_returns - values.detach()
+                # ---- A2C: learned critic advantage ----
+                states_tensor = torch.stack(ep_states)   # (T, state_dim)
+                values = value_head(states_tensor)        # (T,)
+                advantages = raw_returns - values.detach()
 
-            log_prob_tensor = torch.stack(log_probs)
-            policy_loss_terms.append(-(log_prob_tensor * advantages).sum())
-            value_loss_terms.append(F.mse_loss(values, raw_returns.detach()))
+                log_prob_tensor = torch.stack(log_probs)
+                user_policy_loss = -(log_prob_tensor * advantages).sum()
+                user_value_loss = F.mse_loss(values, raw_returns.detach())
+                user_entropy_bonus = (
+                    torch.stack(entropy_terms).mean()
+                    if entropy_terms
+                    else user_policy_loss.new_zeros(())
+                )
 
-            G0 = float(raw_returns[0].item())
+                user_total_loss = (
+                    user_policy_loss
+                    + value_coef * user_value_loss
+                    - entropy_coef * user_entropy_bonus
+                ) / n_users
+
+            # Backprop immediately — releases this user's computation graph
+            scaler.scale(user_total_loss).backward()
+
+            # Accumulate float scalars for epoch logging (no graph retained)
+            acc_policy_loss += user_policy_loss.detach().float().item() / n_users
+            acc_value_loss += user_value_loss.detach().float().item() / n_users
+            acc_entropy_bonus += user_entropy_bonus.detach().float().item() / n_users
+
+            G0 = float(raw_returns[0].float().item())
             # Update EMA as a diagnostic only
             ema_baseline = (1.0 - ema_alpha) * ema_baseline + ema_alpha * G0
 
             episode_returns.append(G0)
-            episode_advantages.append(float(advantages.mean().item()))
+            episode_advantages.append(float(advantages.mean().float().item()))
             episode_lengths.append(float(episode_diag['episode_length']))
             entropies.append(episode_diag['mean_entropy'])
             normalized_entropies.append(episode_diag['mean_normalized_entropy'])
@@ -600,29 +642,20 @@ def train_morl(
             episode_mean_reward_rel.append(episode_diag['mean_reward_rel'])
             episode_mean_reward_health.append(episode_diag['mean_reward_health'])
 
-        policy_loss_raw = torch.stack(policy_loss_terms).mean()
-        value_loss = (
-            torch.stack(value_loss_terms).mean()
-            if value_loss_terms
-            else policy_loss_raw.new_zeros(())
+        # Unscale gradients before inspecting or clipping them
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(
+            list(policy.parameters()) + list(value_head.parameters()), max_norm=1.0
         )
-        entropy_bonus = (
-            torch.stack(entropy_bonus_terms).mean()
-            if entropy_bonus_terms
-            else policy_loss_raw.new_zeros(())
-        )
-        total_loss = policy_loss_raw + value_coef * value_loss - entropy_coef * entropy_bonus
-
-        optimizer.zero_grad()
-        total_loss.backward()
         grad_norm = _grad_norm(policy)
-        optimizer.step()
+        scaler.step(optimizer)
+        scaler.update()
 
         epoch_stats = {
             'epoch': epoch,
-            'policy_loss': float(policy_loss_raw.detach().cpu()),
-            'value_loss': float(value_loss.detach().cpu()),
-            'total_loss': float(total_loss.detach().cpu()),
+            'policy_loss': acc_policy_loss,
+            'value_loss': acc_value_loss,
+            'total_loss': acc_policy_loss + value_coef * acc_value_loss - entropy_coef * acc_entropy_bonus,
             'ema_baseline': ema_baseline,
             'beta': beta,
             'mean_episode_return': _safe_mean(episode_returns),
@@ -631,7 +664,7 @@ def train_morl(
             'mean_rel_hits': _safe_mean(episode_rel_hits),
             'mean_reward_rel': _safe_mean(episode_mean_reward_rel),
             'mean_reward_health': _safe_mean(episode_mean_reward_health),
-            'entropy_bonus': float(entropy_bonus.detach().cpu()),
+            'entropy_bonus': acc_entropy_bonus,
             'entropy_coef': float(entropy_coef),
             'mean_episode_length': _safe_mean(episode_lengths),
             'mean_entropy': _safe_mean(entropies),
@@ -812,43 +845,57 @@ def evaluate_morl(
 
     ndcg_list, health_list, div_list, recall_list = [], [], [], []
 
+    # Pre-move tag tensors to GPU once for the whole eval loop
+    user_tags_gpu = env.user_tags   # already on dev (set in RecommendationEnv.__init__)
+    item_tags_gpu = env.item_tags   # already on dev
+    item_emb_gpu  = env.item_emb    # already on dev
+
+    # Pre-compute log-discount vector for NDCG: 1/log2(rank+1) for rank 1..K
+    positions = torch.arange(1, K + 1, dtype=torch.float32, device=dev)
+    discounts = 1.0 / torch.log2(positions + 1.0)  # (K,)
+
     with torch.no_grad():
         for user_id in eval_user_ids:
             if user_id not in eval_pools:
                 continue
             rec_list = get_recommendations(policy, env, user_id, K, device=dev)
+            k_actual = min(len(rec_list), K)
+            rec_ids_t = torch.tensor(rec_list[:k_actual], dtype=torch.long, device=dev)
 
-            # ---- NDCG@K ----
+            # ---- NDCG@K (vectorized) ----
             ground_truth = set(pos_items_per_user.get(user_id, []))
-            dcg, idcg = 0.0, 0.0
-            for rank, item in enumerate(rec_list[:K], start=1):
-                rel = 1.0 if item in ground_truth else 0.0
-                dcg += rel / math.log2(rank + 1)
-                if rank <= len(ground_truth):
-                    idcg += 1.0 / math.log2(rank + 1)
-            ndcg_list.append(dcg / idcg if idcg > 0 else 0.0)
+            gt_size = len(ground_truth)
+            if gt_size > 0:
+                labels = torch.tensor(
+                    [1.0 if item in ground_truth else 0.0 for item in rec_list[:k_actual]],
+                    dtype=torch.float32, device=dev,
+                )
+                dcg = float((labels * discounts[:k_actual]).sum().item())
+                ideal_k = min(gt_size, K)
+                idcg = float(discounts[:ideal_k].sum().item())
+                ndcg_list.append(dcg / idcg if idcg > 0 else 0.0)
+                # ---- Recall@K ----
+                hits = int((labels > 0.5).sum().item())
+                recall_list.append(hits / gt_size)
+            else:
+                ndcg_list.append(0.0)
+                recall_list.append(0.0)
 
-            # ---- Recall@K ----
-            hits = len(set(rec_list[:K]) & ground_truth)
-            recall_list.append(hits / len(ground_truth) if ground_truth else 0.0)
-
-            # ---- Health score ----
-            user_tag_vec = user_tags[user_id].float()
-            healthy_count = 0
-            for item in rec_list[:K]:
-                if torch.any(torch.logical_and(user_tag_vec.bool(),
-                                               item_tags[item].bool())).item():
-                    healthy_count += 1
+            # ---- Health score (vectorized on GPU) ----
+            user_tag_v = user_tags_gpu[user_id]           # (tag_dim,) on GPU
+            rec_tags_v = item_tags_gpu[rec_ids_t]         # (k, tag_dim) on GPU
+            healthy_count = int(
+                (rec_tags_v.bool() & user_tag_v.bool()).any(dim=1).sum().item()
+            )
             health_list.append(healthy_count / K)
 
-            # ---- Diversity (mean pairwise 1 - cosine_sim) ----
-            if len(rec_list) >= 2:
-                rec_embs = item_emb[rec_list[:K]].to(dev)  # (k, d)
+            # ---- Diversity (GPU, reuse already-transferred embeddings) ----
+            if k_actual >= 2:
+                rec_embs = item_emb_gpu[rec_ids_t]        # (k, d) already on GPU
                 rec_embs_norm = torch.nn.functional.normalize(rec_embs, dim=1)
-                sim_mat = rec_embs_norm @ rec_embs_norm.T  # (k, k)
-                k = rec_embs.size(0)
-                idx = torch.triu_indices(k, k, offset=1)
-                mean_sim = sim_mat[idx[0], idx[1]].mean().item()
+                sim_mat = rec_embs_norm @ rec_embs_norm.T
+                triu_idx = torch.triu_indices(k_actual, k_actual, offset=1)
+                mean_sim = sim_mat[triu_idx[0], triu_idx[1]].mean().item()
                 div_list.append(1.0 - mean_sim)
             else:
                 div_list.append(0.0)

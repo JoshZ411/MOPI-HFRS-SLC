@@ -71,8 +71,6 @@ class RecommendationEnv:
         self.tag_dim = user_tags.size(1)
         self.state_dim = 2 * self.d + self.tag_dim + 1
 
-        self._item_emb_norm = F.normalize(self.item_emb, dim=1)
-
         # Episode state (reset per user)
         self._user_id: int = -1
         self._selected: List[int] = []
@@ -81,6 +79,9 @@ class RecommendationEnv:
         self._tag_coverage = torch.zeros(self.tag_dim, device=self.device)
         self._t: int = 0
         self.last_step_info: Dict[str, float] = {}
+        # Set to False during training to skip the O(remaining×d) score-rank matmul.
+        # Only needed for diagnostic logging; set True on log epochs.
+        self.compute_rank: bool = True
 
     # ------------------------------------------------------------------
     # Public API
@@ -120,23 +121,27 @@ class RecommendationEnv:
             f"action {action} out of range (remaining={len(self._remaining)})"
 
         user_vec = self.user_emb[self._user_id]
-        remaining_indices_before = torch.tensor(self._remaining, dtype=torch.long, device=self.device)
-        remaining_scores_before = self.item_emb[remaining_indices_before] @ user_vec
-        chosen_score = remaining_scores_before[action]
-        chosen_rank_1based = int((remaining_scores_before > chosen_score).sum().item()) + 1
+
+        # ---- score-rank diagnostic (O(remaining×d) matmul — skipped when compute_rank=False) ----
+        if self.compute_rank:
+            rem_t = torch.tensor(self._remaining, dtype=torch.long, device=self.device)
+            rem_scores = self.item_emb[rem_t] @ user_vec
+            chosen_score_t = rem_scores[action]
+            chosen_rank_1based = int((rem_scores > chosen_score_t).sum().item()) + 1
+            chosen_score_val = chosen_score_t.item()
+        else:
+            # Single dot product for the selected item only — O(d) instead of O(remaining×d)
+            chosen_score_val = (self.item_emb[self._remaining[action]] * user_vec).sum().item()
+            chosen_rank_1based = 0
 
         item_idx = self._remaining.pop(action)
         self._selected.append(item_idx)
 
         item_vec = self.item_emb[item_idx]
 
-        # ---- update aggregated embedding first so self._t is consistent ----
-        # (r_rel is computed after done is known; health uses updated coverage)
-
         # ---- update aggregated embedding (incremental mean) ----
         t = len(self._selected)
-        agg_emb = self._agg_emb
-        self._agg_emb = (agg_emb * (t - 1) + item_vec) / t
+        self._agg_emb = (self._agg_emb * (t - 1) + item_vec) / t
 
         self._t += 1
         done = (self._t >= self.K) or (len(self._remaining) == 0)
@@ -144,27 +149,27 @@ class RecommendationEnv:
         # ---- r_rel: per-step binary hit on train positives (no leakage) ----
         r_rel = 1.0 if item_idx in self.train_pos_items.get(self._user_id, set()) else 0.0
 
-        # ---- r_health: marginal Jaccard gain from adding this item ----
+        # ---- r_health: marginal Jaccard gain — kept as GPU tensor to avoid sync stalls ----
         user_tag_vec = self.user_tags[self._user_id]
         old_coverage = self._tag_coverage
         old_inter = torch.sum(torch.min(old_coverage, user_tag_vec))
         old_union = torch.sum(torch.max(old_coverage, user_tag_vec))
-        old_jaccard = (old_inter / (old_union + 1e-8)).item()
 
         new_item_tags = self.item_tags[item_idx]
         self._tag_coverage = torch.clamp(old_coverage + new_item_tags, max=1.0)
         new_inter = torch.sum(torch.min(self._tag_coverage, user_tag_vec))
         new_union = torch.sum(torch.max(self._tag_coverage, user_tag_vec))
-        new_jaccard = (new_inter / (new_union + 1e-8)).item()
-        r_health = new_jaccard - old_jaccard
 
-        reward = torch.tensor([r_rel, r_health], dtype=torch.float32, device=self.device)
+        # Tensor subtraction — no .item() in the hot path (avoids GPU pipeline stall)
+        r_health_t = new_inter / (new_union + 1e-8) - old_inter / (old_union + 1e-8)
+
+        reward = torch.stack([r_health_t.new_tensor(r_rel), r_health_t])
         self.last_step_info = {
-            'chosen_score': chosen_score.item(),
+            'chosen_score': chosen_score_val,
             'chosen_score_rank_1based': float(chosen_rank_1based),
-            'list_rank': self._t,          # 1-indexed rank just assigned
+            'list_rank': self._t,
             'r_rel': r_rel,
-            'r_health': r_health,
+            'r_health': r_health_t.item(),  # single sync per step, deferred to after GPU work
             'terminal': done,
         }
 
