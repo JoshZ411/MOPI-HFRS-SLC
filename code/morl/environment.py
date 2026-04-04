@@ -14,8 +14,10 @@ Reward (2-component scalar, summed in training with a fixed beta weight):
                Fires every step (dense signal).  Uses only train-split labels so
                there is no val/test leakage — the same supervision signal the GNN
                was trained on.
-    r_health = Jaccard(coverage_t, user_tags) - Jaccard(coverage_{t-1}, user_tags)
-               Marginal Jaccard gain computed at every step.
+    r_health = 1.0 if the selected item's tags overlap with the user's health tags,
+               else 0.0.  Binary per-item signal, fires independently at every step.
+               Directly matches the health_score eval metric (fraction of recommended
+               items that individually match the user's health profile).
 """
 
 import torch
@@ -149,19 +151,18 @@ class RecommendationEnv:
         # ---- r_rel: per-step binary hit on train positives (no leakage) ----
         r_rel = 1.0 if item_idx in self.train_pos_items.get(self._user_id, set()) else 0.0
 
-        # ---- r_health: marginal Jaccard gain — kept as GPU tensor to avoid sync stalls ----
+        # ---- r_health: binary per-item tag overlap with user's health profile ----
+        # Fires 1.0 whenever the selected item individually matches the user's health tags.
+        # This directly matches the health_score eval metric (healthy_count / K).
+        # Unlike the previous Jaccard-delta formulation, this signal never saturates:
+        # the policy receives health feedback at every step throughout the full episode.
         user_tag_vec = self.user_tags[self._user_id]
-        old_coverage = self._tag_coverage
-        old_inter = torch.sum(torch.min(old_coverage, user_tag_vec))
-        old_union = torch.sum(torch.max(old_coverage, user_tag_vec))
-
         new_item_tags = self.item_tags[item_idx]
-        self._tag_coverage = torch.clamp(old_coverage + new_item_tags, max=1.0)
-        new_inter = torch.sum(torch.min(self._tag_coverage, user_tag_vec))
-        new_union = torch.sum(torch.max(self._tag_coverage, user_tag_vec))
+        has_health_overlap = (new_item_tags.bool() & user_tag_vec.bool()).any()
+        r_health_t = torch.ones((), device=self.device) if has_health_overlap else torch.zeros((), device=self.device)
 
-        # Tensor subtraction — no .item() in the hot path (avoids GPU pipeline stall)
-        r_health_t = new_inter / (new_union + 1e-8) - old_inter / (old_union + 1e-8)
+        # Still update tag_coverage for the state representation (_build_state uses it)
+        self._tag_coverage = torch.clamp(self._tag_coverage + new_item_tags, max=1.0)
 
         reward = torch.stack([r_health_t.new_tensor(r_rel), r_health_t])
         self.last_step_info = {
@@ -169,7 +170,7 @@ class RecommendationEnv:
             'chosen_score_rank_1based': float(chosen_rank_1based),
             'list_rank': self._t,
             'r_rel': r_rel,
-            'r_health': r_health_t.item(),  # single sync per step, deferred to after GPU work
+            'r_health': r_health_t.item(),  # 1.0 = item matched user health tags, 0.0 = no match
             'terminal': done,
         }
 

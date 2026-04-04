@@ -42,6 +42,38 @@ def resolve_device(device_arg: str) -> torch.device:
     return torch.device(device_arg)
 
 
+def _print_morl_metrics_table(metrics: dict, split: str, K: int, num_items: int) -> None:
+    """Print MORL policy metrics in the same tabular format as rerank_baseline."""
+    ndcg      = metrics.get('ndcg', 0.0)
+    recall    = metrics.get('recall', 0.0)
+    health    = metrics.get('health_score', 0.0)
+    diversity = metrics.get('diversity', 0.0)
+
+    header    = f"{'':>4}{'ndcg':>8}  {'recall':>8}  {'health':>8}  {'diversity':>10}"
+    separator = '-' * len(header)
+
+    print()
+    print(f'=== MORL Policy — {split.capitalize()} Results ===')
+    print(f'Split: {split} | K={K} | items={num_items}')
+    print()
+    print(
+        f'  MORL policy:  '
+        f'ndcg={ndcg:.5f}  '
+        f'recall={recall:.5f}  '
+        f'health={health:.5f}  '
+        f'diversity={diversity:.5f}'
+    )
+    print()
+    print(header)
+    print(separator)
+    print(
+        f"{'':>4}{ndcg:>8.5f}  {recall:>8.5f}  {health:>8.5f}  {diversity:>10.5f}"
+        f'  <-- MORL policy'
+    )
+    print(separator)
+    print()
+
+
 def main():
     parser = argparse.ArgumentParser(description='MORL sequential recommendation')
     parser.add_argument('--checkpoint', type=str, default='embeddings_checkpoint.pt',
@@ -245,10 +277,10 @@ def main():
         train_pos_items={u: set(items) for u, items in train_pos.items()},
         val_pos_items={u: set(items) for u, items in val_pos.items()},
         exclude_per_user_train=None,
-        exclude_per_user_val=exclude_val,
+        exclude_per_user_val=None,  # match original: no exclusion at eval
         K=args.K,
         M=m_train,
-        eval_M=args.M,
+        eval_M=num_items,  # full item space at eval — matches published baseline
         hidden_dim=args.hidden_dim,
         num_epochs=args.epochs,
         batch_size=args.batch_size,
@@ -282,16 +314,15 @@ def main():
         item_tags=food_tags,
         eval_user_ids=val_users,
         pos_items_per_user=val_pos,
-        exclude_per_user=exclude_val,
+        exclude_per_user=None,  # match original: no exclusion at eval
         K=args.K,
-        M=args.M,
+        M=num_items,  # full item space — matches published baseline
         device=device,
     )
 
-    logger.info('=== Validation Results (MORL, sequential) ===')
     for key, value in val_metrics.items():
-        logger.info('  %s: %.5f', key, value)
         append_jsonl(eval_path, {'type': 'val_metric', 'metric': key, 'value': float(value)})
+    _print_morl_metrics_table(val_metrics, split='val', K=args.K, num_items=num_items)
 
     if tracker is not None:
         tracker.log({f'val/{key}': value for key, value in val_metrics.items()})
@@ -308,16 +339,15 @@ def main():
         item_tags=food_tags,
         eval_user_ids=test_users,
         pos_items_per_user=test_pos,
-        exclude_per_user=exclude_test,
+        exclude_per_user=None,  # match original: no exclusion at eval
         K=args.K,
-        M=args.M,
+        M=num_items,  # full item space — matches published baseline
         device=device,
     )
 
-    logger.info('=== Test Results (MORL, sequential) ===')
     for k, v in test_metrics.items():
-        logger.info('  %s: %.5f', k, v)
         append_jsonl(eval_path, {'type': 'test_metric', 'metric': k, 'value': float(v)})
+    _print_morl_metrics_table(test_metrics, split='test', K=args.K, num_items=num_items)
 
     if tracker is not None:
         tracker.log({f'test/{key}': value for key, value in test_metrics.items()})
