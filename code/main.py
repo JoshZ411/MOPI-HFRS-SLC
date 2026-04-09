@@ -171,6 +171,15 @@ def main():
                 'test_percentage_recommended_foods': round(percentage_recommended_foods, 5)
             })
 
+        # Save frozen embeddings for downstream MORL sequential recommendation
+        users_emb_final, _, items_emb_final, _ = \
+            model.forward(feature_dict, test_edge_index, pos_test_edge_index, neg_test_edge_index)
+        torch.save(
+            {'user_emb': users_emb_final.detach().cpu(),
+             'item_emb': items_emb_final.detach().cpu()},
+            'embeddings_checkpoint.pt'
+        )
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()

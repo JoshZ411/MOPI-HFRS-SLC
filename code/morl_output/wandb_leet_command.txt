@@ -1,0 +1,1 @@
+/home/aarya/miniconda3/envs/FRS/bin/python -m wandb beta leet run /home/aarya/home/developer/school/capstone/new-mopi/MOPI-HFRS-SLC/code/morl_output/wandb/wandb/offline-run-20260318_163637-5oyedkn9/run-5oyedkn9.wandb
