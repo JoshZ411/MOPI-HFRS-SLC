@@ -111,7 +111,7 @@ WANDB_MODE=offline python -m morl.morl_main \
 | β | Expected NDCG | Expected Health |
 |---|--------------|----------------|
 | 0.5 | ~0.206 (near GNN baseline) | ~0.696 |
-| 1.5 | ~0.210 | ~0.70 |
+| 1.5 | ~0.163 | ~0.70 |
 | 4.0 | ~0.160 | ~0.920 |
 | 20.0 | ~0.172 | ~0.963 |
 
