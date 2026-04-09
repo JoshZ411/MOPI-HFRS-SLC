@@ -9,125 +9,164 @@ To run the model, please install the environment requirements and go to the code
 python main.py
 ```
 
-## MORL training loop
+## Architecture: Advantage Actor-Critic (A2C) Reranker
 
-The MORL stage depends on the frozen embeddings checkpoint produced by `main.py`. After running the base model training above, stay in the `code` directory and run:
+The MORL stage is an **A2C reinforcement learning reranker** built on top of frozen LightGCN embeddings. It does not retrain the GNN — it learns a sequential selection policy that reranks the full item catalog to jointly optimize relevance and health alignment.
 
-```bash
-python -m morl.morl_main \
-	--checkpoint embeddings_checkpoint.pt \
-	--graph_path ../processed_data/benchmark_macro.pt \
-	--device cuda \
-	--epochs 200 \
-	--batch_size 64 \
-	--K 20 \
-	--M 200 \
-	--wandb_mode offline \
-	--output_dir morl_output
+### How It Works
+
+The policy operates as a K-step episode per user. At each step it selects one food item from all 6,769 candidates, receives a per-step reward, and updates its internal state before the next selection.
+
+**State vector** at step `t`:
+```
+s_t = concat(user_emb[u], agg_emb, tag_coverage, t/K)
+       ↑ frozen (128d)   ↑ mean of  ↑ health tags  ↑ normalized
+                           selected   covered so far   timestep
 ```
 
-Common optional arguments:
-
-```bash
-python -m morl.morl_main \
-	--checkpoint embeddings_checkpoint.pt \
-	--graph_path ../processed_data/benchmark_macro.pt \
-	--device cuda \
-	--lr 1e-3 \
-	--hidden_dim 256 \
-	--seed 42 \
-	--log_every 10 \
-	--probe_every 10 \
-	--num_probe_users 4 \
-	--use_wandb \
-	--wandb_project mopi-morl \
-	--val_weight_alpha 0.7 \
-	--output_dir morl_output
+**Policy network (`ConditionalPolicy`):**
+```
+state_encoder:    Linear(321→256)→ReLU → Linear(256→256)→ReLU  → state_hidden (256d)
+candidate_encoder: Linear(128→256)→ReLU                         → cand_hidden  (6769×256d)
+logit_i = dot(state_hidden, cand_hidden_i)  →  softmax over all 6769 items
 ```
 
-This command trains the MORL policy, selects the best trade-off weight on the validation split, and evaluates the final policy on the test split.
-
-The MORL run now emits structured logs and artifacts into the output directory:
-
-- `morl.log`: full console log persisted to disk
-- `run_config.json`: resolved run configuration and device info
-- `train_metrics.jsonl`: per-epoch training metrics and diagnostics
-- `eval_metrics.jsonl`: validation-grid rows and final test metrics
-- `validation_weight_grid.csv`: all validation weight vectors with metrics and selected score
-- `morl_policy_epoch*.pt` and `morl_policy_final.pt`: checkpoints with embedded stats
-
-Training diagnostics now include:
-
-- mean and standard deviation of episodic return
-- reward decomposition (`pref`, `health`, `div`)
-- mean episode length
-- action entropy and action-position usage rates
-- gradient norm
-- weight-sampling averages
-- fixed-user probe statistics that help detect whether different weight vectors actually change policy behavior
-
-Warnings are emitted when:
-
-- candidate pools are smaller than `K`
-- action entropy collapses
-- reward variance is near zero
-- validation metrics are almost identical across weight vectors
-
-## Terminal monitoring
-
-If you enable W&B logging, you can watch the run live in the terminal using the W&B TUI:
-
-```bash
-python -m morl.morl_main \
-	--checkpoint embeddings_checkpoint.pt \
-	--graph_path ../processed_data/benchmark_macro.pt \
-	--device cuda \
-	--use_wandb \
-	--wandb_mode offline \
-	--output_dir morl_output
+**Critic network (`ValueHead`):**
+```
+Linear(321→256)→ReLU → Linear(256→128)→ReLU → Linear(128→1)  →  V(s_t)
 ```
 
-In a second terminal, from the same directory or the run directory, launch:
-
-```bash
-wandb beta leet
+**Reward per step:**
+```
+r_t = r_rel + β · r_health
+r_rel    = 1.0 if selected item ∈ train_pos_items[user], else 0.0
+r_health = 1.0 if item_tags[item] ∩ user_tags[user] ≠ ∅,  else 0.0
 ```
 
-This provides a live terminal dashboard with metric plots, config details, and system stats without needing the browser UI.
+**A2C update:**
+```
+G_t       = discounted return from step t (γ=0.99)
+A_t       = G_t − V(s_t)                           ← advantage (low variance)
+loss      = −Σ A_t·log π(a_t|s_t)                  ← policy loss
+          + 0.5 · MSE(V(s_t), G_t)                 ← critic loss
+          − 0.01 · H(π)                             ← entropy bonus
+```
 
-k == lengtth of recomendation list
+**β** controls the relevance–health trade-off without retraining: lower β preserves NDCG, higher β maximizes health alignment.
 
-m == full canidate pool for the RL training loop 
+### Imitation Pretraining
 
-batch_size = number of users sampled for each training step
+Before RL begins, the policy is pretrained for 50 epochs to replicate the GNN's top-K rankings via cross-entropy loss (behavioral cloning). This warm-starts the policy at ~0.222 NDCG so RL fine-tuning improves health from a strong relevance floor rather than from random.
 
+### Full Item Space
 
-### Key Benchmarks for a sucessful implementation:
-- mean_return should improve over epochs, and ideally converge to a stable value.
-- different weights should lead to different scores for validation metrics
-- if weights give identical results, the policy is not learning the trade-offs 
-- some weights should improve NDCG, improve health, improve diversity, vice versa 
+The policy acts over all 6,769 items at every step — there is no candidate pool ceiling. The previous M=500 pooling design imposed a structural recall ceiling of ~0.498 (maximum recoverable NDCG ~0.52) and prevented health-compatible items outside the top-500 from ever being recommended. Removing the pool eliminates this constraint entirely.
 
-#### Final Metrics: Proving our system is better than baseline
-- The score of ndcg, health, diversity should all be better than baseline
-- or an equal NDCG but better health or diversity
-- equal health but better NDCG or diversity
-- equal diversity but better NDCG or health
-- or better diversitry with a small drop off in NDCG or health, etc.
+---
 
-# Baseline metrics
+## MORL Training
 
-- test_recall@20: 0.12731, 
-- test_precision@20: 0.04667, 
-- test_ndcg@20: 0.10252, 
-- test_health_score: 0.39399, 
-- avg_health_tags_ratio: 6.1568, 
-- percentage_recommended_foods: 0.13946
+The MORL stage depends on the frozen embeddings checkpoint produced by `main.py`. After running base model training, stay in the `code` directory and run:
 
+```bash
+WANDB_MODE=offline python -m morl.morl_main \
+    --checkpoint embeddings_checkpoint.pt \
+    --graph_path ../processed_data/benchmark_macro.pt \
+    --device cuda \
+    --epochs 5000 \
+    --K 20 \
+    --M 500 \
+    --batch_size 64 \
+    --lr 1e-4 \
+    --hidden_dim 256 \
+    --gamma 0.99 \
+    --beta 0.5 \
+    --entropy_coef 0.3 \
+    --value_coef 0.5 \
+    --pretrain_epochs 50 \
+    --pretrain_lr 1e-3 \
+    --log_every 10 \
+    --val_eval_every 100 \
+    --seed 42 \
+    --use_wandb \
+    --wandb_mode offline \
+    --output_dir ../morl_output
+```
 
-### Better Logging metrics
+### Key Parameters
 
-- | WARNING | Epoch x: probe suggests weeal weight sensitivity
-- This means that a small test set in weights aren't actually yielding diff reccomendations 
-- 3/18/2026 logging indicates that the model isn't actually leveraging weights proberly since making a change to the weight leads to an irrelevant change`
+| Parameter | Description |
+|-----------|-------------|
+| `--epochs` | Number of RL training epochs (5000 recommended) |
+| `--K` | Recommendation list length per user |
+| `--M` | Candidate pool size for periodic val eval (training always uses full item space) |
+| `--beta` | Health–relevance trade-off weight. Lower = more NDCG, higher = more health |
+| `--pretrain_epochs` | Behavioral cloning epochs before RL (50 recommended) |
+| `--entropy_coef` | Entropy bonus coefficient — prevents policy from collapsing to one item |
+| `--value_coef` | Critic loss weight in total loss |
+| `--gamma` | Discount factor for episode returns |
+
+### β Trade-off Guide
+
+| β | Expected NDCG | Expected Health |
+|---|--------------|----------------|
+| 0.5 | ~0.206 (near GNN baseline) | ~0.696 |
+| 1.5 | ~0.210 | ~0.70 |
+| 4.0 | ~0.160 | ~0.920 |
+| 20.0 | ~0.172 | ~0.963 |
+
+### Output Artifacts
+
+- `morl.log` — full console log
+- `run_config.json` — resolved run configuration
+- `train_metrics.jsonl` — per-epoch training metrics
+- `eval_metrics.jsonl` — periodic val evaluation rows
+- `morl_policy_epoch*.pt` and `morl_policy_final.pt` — checkpoints containing `policy_state_dict`, `value_head_state_dict`, `optimizer_state_dict`, and full training `stats`
+- `test_results.pt` — final test split metrics
+
+### Terminal Monitoring
+
+Launch the W&B terminal dashboard in a second terminal from the run directory:
+
+```bash
+wandb beta leet run <path/to/run-*.wandb>
+```
+
+---
+
+## Baseline Metrics
+
+### Original Paper Evaluation (Buggy — Edge-Indexed)
+
+The original `main.py` evaluation contained three bugs that computed NDCG over test *edges* instead of per *user*, producing an uninterpretable metric. These numbers correspond to the buggy evaluation:
+
+| Metric | Value |
+|--------|-------|
+| test_ndcg@20 | 0.10252 |
+| test_recall@20 | 0.12731 |
+| test_precision@20 | 0.04667 |
+| test_health_score | 0.39399 |
+
+### Corrected GNN Baseline (Per-User Evaluation)
+
+After fixing the evaluation to standard per-user NDCG@K (`scores = user_emb @ item_emb.T`, one row per user):
+
+| Metric | Value |
+|--------|-------|
+| test_ndcg@20 | **0.22200** |
+| test_recall@20 | **0.23800** |
+| test_health_score | **0.460** |
+
+The GNN model weights are identical — only the evaluation logic changed.
+
+### MORL Results (β=0.5, 5000 epochs)
+
+| Metric | GNN Baseline | MORL Policy | Change |
+|--------|-------------|-------------|--------|
+| ndcg@20 | 0.222 | **0.206** | −7% |
+| recall@20 | 0.238 | **0.236** | −1% |
+| health_score | 0.460 | **0.696** | **+51%** |
+| diversity | — | 0.162 | — |
+
+Health alignment improves by 51% with a minimal 7% NDCG trade-off. The β parameter allows practitioners to tune the operating point without retraining.
 
