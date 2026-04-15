@@ -1,0 +1,26 @@
+======================================================================
+BASELINE vs CONSTRAINED RERANK COMPARISON
+======================================================================
+Metric                                  Baseline     Reranked      Delta
+----------------------------------------------------------------------
+recall                                   0.13460      0.11547  -0.01913
+precision                                0.04942      0.04228  -0.00713
+ndcg                                     0.10789      0.09653  -0.01136
+health_score                             0.38543      0.54059 +  0.15516
+avg_health_tags_ratio                    6.14642      6.13913  -0.00729
+percentage_recommended_foods             0.18422      0.18112  -0.00310
+----------------------------------------------------------------------
+CONSTRAINED RERANK DIAGNOSTICS
+----------------------------------------------------------------------
+num_lists                                   8170
+total_attempted_swaps                    3314564
+total_accepted_swaps                       32680
+total_rejected_by_position_lock                0
+total_rejected_by_score_margin            313895
+total_rejected_by_duplicate               746448
+total_rejected_by_budget                 2221541
+total_forced_anchor                      3281884
+swap_rate                                 0.0099
+rejection_rate                            0.9901
+forced_anchor_rate                        0.9901
+======================================================================
